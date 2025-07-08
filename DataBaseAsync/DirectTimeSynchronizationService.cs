@@ -15,8 +15,7 @@ namespace DataBaseAsync
     /// </summary>
     public static class DirectTimeSynchronizationService
     {
-        private static readonly ILogger _logger = LoggerFactory.Create(builder => builder.AddConsole()).CreateLogger("DirectTimeSynchronizationService");
-
+        static  Logger _logger=Logger.Instance;
         // Windows API 用于设置系统时间
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool SetSystemTime(ref SYSTEMTIME st);
@@ -51,13 +50,13 @@ namespace DataBaseAsync
                 DateTime followerTime = GetDatabaseTime(followerConnectionString);
                 
                 TimeSpan difference = followerTime - leaderTime;
-                _logger.LogInformation($"时间差异检查: 主库时间={leaderTime:yyyy-MM-dd HH:mm:ss.ffffff}, 从库时间={followerTime:yyyy-MM-dd HH:mm:ss.ffffff}, 差异={difference.TotalSeconds:F3}秒");
+                _logger.Info($"时间差异检查: 主库时间={leaderTime:yyyy-MM-dd HH:mm:ss.ffffff}, 从库时间={followerTime:yyyy-MM-dd HH:mm:ss.ffffff}, 差异={difference.TotalSeconds:F3}秒");
                 
                 return difference;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "检查时间差异时发生错误");
+                _logger.Error("检查时间差异时发生错误", ex);
                 throw;
             }
         }
@@ -79,13 +78,13 @@ namespace DataBaseAsync
                 TimeSpan difference = systemTime - leaderTime;
                 double differenceSeconds = Math.Abs(difference.TotalSeconds);
                 
-                _logger.LogInformation($"当前系统时间: {systemTime:yyyy-MM-dd HH:mm:ss.ffffff}");
-                _logger.LogInformation($"主库时间: {leaderTime:yyyy-MM-dd HH:mm:ss.ffffff}");
-                _logger.LogInformation($"时间差异: {difference.TotalSeconds:F3}秒");
+                _logger.Info($"当前系统时间: {systemTime:yyyy-MM-dd HH:mm:ss.ffffff}");
+                _logger.Info($"主库时间: {leaderTime:yyyy-MM-dd HH:mm:ss.ffffff}");
+                _logger.Info($"时间差异: {difference.TotalSeconds:F3}秒");
                 
                 if (differenceSeconds <= thresholdSeconds)
                 {
-                    _logger.LogInformation($"时间差异({differenceSeconds:F3}秒)在阈值({thresholdSeconds}秒)内，无需同步");
+                    _logger.Info($"时间差异({differenceSeconds:F3}秒)在阈值({thresholdSeconds}秒)内，无需同步");
                     return false;
                 }
                 
@@ -94,19 +93,19 @@ namespace DataBaseAsync
                 
                 if (success)
                 {
-                    _logger.LogInformation($"系统时间已同步到主库时间: {leaderTime:yyyy-MM-dd HH:mm:ss.ffffff}");
+                    _logger.Info($"系统时间已同步到主库时间: {leaderTime:yyyy-MM-dd HH:mm:ss.ffffff}");
                     return true;
                 }
                 else
                 {
                     int errorCode = Marshal.GetLastWin32Error();
-                    _logger.LogError($"设置系统时间失败，错误代码: {errorCode}。可能需要管理员权限。");
+                    _logger.Error($"设置系统时间失败，错误代码: {errorCode}。可能需要管理员权限。");
                     return false;
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "同步系统时间时发生错误");
+                _logger.Error("同步系统时间时发生错误",ex);
                 return false;
             }
         }
@@ -169,7 +168,7 @@ namespace DataBaseAsync
             }
             catch (Exception ex)
             {
-                _logger.LogError($"检查系统时间权限时发生错误: {ex.Message}");
+                _logger.Error($"检查系统时间权限时发生错误: {ex.Message}");
                 return false;
             }
         }
@@ -188,7 +187,7 @@ namespace DataBaseAsync
                     return true;
                 }
 
-                _logger.LogInformation("正在请求管理员权限...");
+                _logger.Info("正在请求管理员权限...");
 
                 // 获取当前程序的路径
                 string currentExecutable = Process.GetCurrentProcess().MainModule.FileName;
@@ -207,26 +206,26 @@ namespace DataBaseAsync
                 
                 if (elevatedProcess != null)
                 {
-                    _logger.LogInformation("已成功请求管理员权限，程序将重新启动");
+                    _logger.Info("已成功请求管理员权限，程序将重新启动");
                     // 当前进程退出
                     Environment.Exit(0);
                     return true;
                 }
                 else
                 {
-                    _logger.LogWarning("无法启动具有管理员权限的进程");
+                    _logger.Warning("无法启动具有管理员权限的进程");
                     return false;
                 }
             }
             catch (Win32Exception ex) when (ex.NativeErrorCode == 1223)
             {
                 // 用户取消了UAC提示
-                _logger.LogWarning("用户取消了管理员权限请求");
+                _logger.Warning("用户取消了管理员权限请求");
                 return false;
             }
             catch (Exception ex)
             {
-                _logger.LogError($"请求管理员权限时发生错误: {ex.Message}");
+                _logger.Error($"请求管理员权限时发生错误: {ex.Message}");
                 return false;
             }
         }

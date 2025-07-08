@@ -5,6 +5,7 @@ using Microsoft.Extensions.Configuration;
 using System.Reflection;
 using System.Linq;
 using DataBaseAsync;
+using DataBaseAsync;
 
 namespace DatabaseReplication.Leader
 {
@@ -49,6 +50,9 @@ namespace DatabaseReplication.Leader
     {
         static async Task Main(string[] args)
         {
+            // 初始化日志记录器
+            var logger = Logger.Instance;
+            
             // 读取配置文件
             var configuration = new ConfigurationBuilder()
                 .SetBasePath(Directory.GetCurrentDirectory())
@@ -58,7 +62,7 @@ namespace DatabaseReplication.Leader
             var config = configuration.GetSection("DatabaseReplication").Get<DatabaseReplicationConfig>();
             if (config == null)
             {
-                Console.WriteLine("无法读取配置文件，请检查 appsettings.json");
+                logger.Error("无法读取配置文件，请检查 appsettings.json");
                 return;
             }
 
@@ -76,21 +80,21 @@ namespace DatabaseReplication.Leader
                 Type? entityType = GetEntityType(tableConfigData.EntityTypeName);
                 if (entityType == null)
                 {
-                    Console.WriteLine($"找不到实体类型: {tableConfigData.EntityTypeName}");
+                    logger.Error($"找不到实体类型: {tableConfigData.EntityTypeName}");
                     continue;
                 }
 
                 // 解析复制方向
                 if (!Enum.TryParse<ReplicationDirection>(tableConfigData.ReplicationDirection, out var direction))
                 {
-                    Console.WriteLine($"无效的复制方向: {tableConfigData.ReplicationDirection}");
+                    logger.Error($"无效的复制方向: {tableConfigData.ReplicationDirection}");
                     continue;
                 }
 
                 // 解析冲突解决策略
                 if (!Enum.TryParse<ConflictResolutionStrategy>(tableConfigData.ConflictStrategy, out var conflictStrategy))
                 {
-                    Console.WriteLine($"无效的冲突解决策略: {tableConfigData.ConflictStrategy}，使用默认策略 PreferLeader");
+                    logger.Warning($"无效的冲突解决策略: {tableConfigData.ConflictStrategy}，使用默认策略 PreferLeader");
                     conflictStrategy = ConflictResolutionStrategy.PreferLeader;
                 }
 
@@ -128,40 +132,40 @@ namespace DatabaseReplication.Leader
             {
                 // 初始化从库（创建表和触发器）
                 followerContext.Initialize();
-                Console.WriteLine("从库初始化完成，复制触发器已创建");
+                logger.Info("从库初始化完成，复制触发器已创建");
 
                 // 直接时间同步处理
                 Timer? timeSyncTimer = null;
                 if (config.TimeSynchronization.Enabled)
                 {
-                    Console.WriteLine("正在检查系统时间权限...");
+                    logger.Info("正在检查系统时间权限...");
                     if (!DirectTimeSynchronizationService.HasSystemTimePrivilege())
                     {
-                        Console.WriteLine("检测到程序需要管理员权限才能修改系统时间");
-                        Console.WriteLine("正在请求管理员权限...");
+                        logger.Warning("检测到程序需要管理员权限才能修改系统时间");
+                        logger.Info("正在请求管理员权限...");
                         
                         // 尝试请求管理员权限
                         if (!DirectTimeSynchronizationService.RequestAdministratorPrivileges())
                         {
-                            Console.WriteLine("错误：无法获取管理员权限");
-                            Console.WriteLine("请手动以管理员身份重新运行此程序");
-                            Console.WriteLine("按任意键退出...");
+                            logger.Error("错误：无法获取管理员权限");
+                            logger.Error("请手动以管理员身份重新运行此程序");
+                            logger.Info("按任意键退出...");
                             Console.ReadKey();
                             return;
                         }
                         // 如果成功请求权限，程序会自动重启，这里不会执行到
                     }
                     
-                    Console.WriteLine("检测到管理员权限，启用直接时间同步功能");
+                    logger.Info("检测到管理员权限，启用直接时间同步功能");
                     
                     // 启动时同步
                     if (config.TimeSynchronization.SyncOnStartup)
                     {
-                        Console.WriteLine("正在执行启动时间同步...");
+                        logger.Info("正在执行启动时间同步...");
                         bool syncResult = DirectTimeSynchronizationService.SynchronizeToLeaderTime(
                             leaderConnectionString, 
                             config.TimeSynchronization.MaxAllowedDifferenceSeconds);
-                        Console.WriteLine(syncResult ? "启动时间同步完成" : "启动时间同步跳过（时间差异在阈值内或同步失败）");
+                        logger.Info(syncResult ? "启动时间同步完成" : "启动时间同步跳过（时间差异在阈值内或同步失败）");
                     }
                     
                     // 设置定期同步
@@ -171,15 +175,15 @@ namespace DatabaseReplication.Leader
                         {
                             try
                             {
-                                Console.WriteLine("执行定期时间同步检查...");
+                                logger.Info("执行定期时间同步检查...");
                                 bool syncResult = DirectTimeSynchronizationService.SynchronizeToLeaderTime(
                                     leaderConnectionString, 
                                     config.TimeSynchronization.MaxAllowedDifferenceSeconds);
-                                Console.WriteLine(syncResult ? "定期时间同步完成" : "定期时间同步跳过（时间差异在阈值内或同步失败）");
+                                logger.Info(syncResult ? "定期时间同步完成" : "定期时间同步跳过（时间差异在阈值内或同步失败）");
                             }
                             catch (Exception ex)
                             {
-                                Console.WriteLine($"定期时间同步出错: {ex.Message}");
+                                logger.Error($"定期时间同步出错: {ex.Message}");
                             }
                         }, null, TimeSpan.FromMinutes(config.TimeSynchronization.TimeSyncIntervalMinutes), TimeSpan.FromMinutes(config.TimeSynchronization.TimeSyncIntervalMinutes));
                     }
@@ -201,9 +205,9 @@ namespace DatabaseReplication.Leader
                     await replicator.InitializeExistingData(true);
                 }
                 replicator.StartReplication();
-                Console.WriteLine("从库复制服务已启动，开始同步数据...");
+                logger.Info("从库复制服务已启动，开始同步数据...");
 
-                Console.WriteLine("按ESC键退出...");
+                logger.Info("按ESC键退出...");
                 while (Console.ReadKey(true).Key != ConsoleKey.Escape) { }
 
                 // 停止复制器
@@ -213,7 +217,7 @@ namespace DatabaseReplication.Leader
                 if (timeSyncTimer != null)
                 {
                     timeSyncTimer.Dispose();
-                    Console.WriteLine("时间同步定时器已停止");
+                    logger.Info("时间同步定时器已停止");
                 }
             }
         }

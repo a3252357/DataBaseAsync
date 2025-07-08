@@ -1,10 +1,11 @@
-﻿using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore;
 using MySqlConnector;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.Reflection;
 using System.Text;
+using DataBaseAsync;
 
 namespace DatabaseReplication
 {
@@ -13,6 +14,7 @@ namespace DatabaseReplication
         private readonly string _connectionString;
         private readonly string _followerServerId;
         private readonly List<TableConfig> _tableConfigs;
+        private readonly Logger _logger;
 
         public FollowerDbContext(
             DbContextOptions<FollowerDbContext> options,
@@ -24,6 +26,7 @@ namespace DatabaseReplication
             _connectionString = connectionString;
             _followerServerId = followerServerId;
             _tableConfigs = tableConfigs;
+            _logger = Logger.Instance;
             Database.SetConnectionString(_connectionString);
         }
 
@@ -255,8 +258,8 @@ namespace DatabaseReplication
                     catch (Exception ex)
                     {
                         transaction.Rollback();
-                        Console.WriteLine($"执行SQL时出错: {ex.Message}");
-                        Console.WriteLine($"SQL: {sql}");
+                        _logger.Error($"执行SQL时出错: {ex.Message}");
+                        _logger.Error($"SQL: {sql}");
                         throw;
                     }
                 }
@@ -279,8 +282,8 @@ namespace DatabaseReplication
                 catch (Exception ex)
                 {
                     transaction.Rollback();
-                    Console.WriteLine($"执行SQL时出错: {ex.Message}");
-                    Console.WriteLine($"SQL: {sql}");
+                    _logger.Error($"执行SQL时出错: {ex.Message}");
+                    _logger.Error($"SQL: {sql}");
                     throw;
                 }
             }

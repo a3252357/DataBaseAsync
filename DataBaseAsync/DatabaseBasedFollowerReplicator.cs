@@ -11,6 +11,7 @@ using System.Reflection;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using DataBaseAsync;
 
 namespace DatabaseReplication.Follower
 {
@@ -21,12 +22,16 @@ namespace DatabaseReplication.Follower
         private readonly string _leaderConnectionString;
         private readonly List<TableConfig> _tableConfigs;
         private readonly Dictionary<string, Timer> _timers = new Dictionary<string, Timer>();
+        private readonly Dictionary<string, bool> _executionFlags = new Dictionary<string, bool>();
+        private readonly object _executionLock = new object();
         private readonly int _batchSize;
         private readonly int _dataRetentionDays;
         private readonly int _cleanupIntervalHours;
         private bool _isRunning = false;
         private bool _isInitializationMode = false;
         private Timer _cleanupTimer;
+        private bool _isCleanupExecuting = false;
+        private readonly Logger _logger;
 
         public DatabaseBasedFollowerReplicator(
             string followerServerId,
@@ -44,6 +49,7 @@ namespace DatabaseReplication.Follower
             _batchSize = batchSize;
             _dataRetentionDays = dataRetentionDays;
             _cleanupIntervalHours = cleanupIntervalHours;
+            _logger = Logger.Instance;
             CreateReplicationStatusTable();
         }
 
@@ -60,38 +66,44 @@ namespace DatabaseReplication.Follower
                 if (tableConfig.ReplicationDirection == ReplicationDirection.Bidirectional ||
                     tableConfig.ReplicationDirection == ReplicationDirection.LeaderToFollower)
                 {
+                    var timerKey = $"LeaderToFollower_{tableConfig.TableName}";
+                    _executionFlags[timerKey] = false;
+                    
                     var timer = new Timer(
-                        async _ => await PullAndApplyChanges(tableConfig),
+                        async _ => await ExecuteWithFlag(timerKey, () => PullAndApplyChanges(tableConfig)),
                         null,
                         TimeSpan.Zero,
                         TimeSpan.FromSeconds(tableConfig.ReplicationIntervalSeconds));
 
-                    _timers[$"LeaderToFollower_{tableConfig.TableName}"] = timer;
+                    _timers[timerKey] = timer;
                 }
 
                 // 启动从库到主库的同步计时器（双向复制）
                 if (tableConfig.ReplicationDirection == ReplicationDirection.Bidirectional ||
                     tableConfig.ReplicationDirection == ReplicationDirection.FollowerToLeader)
                 {
+                    var timerKey = $"FollowerToLeader_{tableConfig.TableName}";
+                    _executionFlags[timerKey] = false;
+                    
                     var timer = new Timer(
-                        async _ => await PushFollowerChangesToLeader(tableConfig),
+                        async _ => await ExecuteWithFlag(timerKey, () => PushFollowerChangesToLeader(tableConfig)),
                         null,
                         TimeSpan.Zero,
                         TimeSpan.FromSeconds(tableConfig.ReplicationIntervalSeconds));
 
-                    _timers[$"FollowerToLeader_{tableConfig.TableName}"] = timer;
+                    _timers[timerKey] = timer;
                 }
             }
 
             // 启动数据清理定时器
             _cleanupTimer = new Timer(
-                async _ => await CleanupOldReplicationLogs(),
+                async _ => await ExecuteCleanupWithFlag(),
                 null,
                 TimeSpan.Zero, // 立即执行一次
                 TimeSpan.FromHours(_cleanupIntervalHours)); // 定期执行
 
-            Console.WriteLine($"从库 {_followerServerId} 复制服务已启动");
-            Console.WriteLine($"数据清理任务已启动，保留 {_dataRetentionDays} 天数据，每 {_cleanupIntervalHours} 小时执行一次清理");
+            _logger.Info($"从库 {_followerServerId} 复制服务已启动");
+            _logger.Info($"数据清理任务已启动，保留 {_dataRetentionDays} 天数据，每 {_cleanupIntervalHours} 小时执行一次清理");
         }
 
         // 停止复制服务
@@ -108,28 +120,35 @@ namespace DatabaseReplication.Follower
 
             _timers.Clear();
             
+            // 清理执行状态标志
+            lock (_executionLock)
+            {
+                _executionFlags.Clear();
+            }
+            
             // 停止清理定时器
             _cleanupTimer?.Dispose();
             _cleanupTimer = null;
+            _isCleanupExecuting = false;
             
-            Console.WriteLine($"从库 {_followerServerId} 复制服务已停止");
+            _logger.Info($"从库 {_followerServerId} 复制服务已停止");
         }
 
         // 初始化旧数据同步
         public async Task InitializeExistingData(bool parallel = true, int maxConcurrency = 3)
         {
-            Console.WriteLine("开始初始化旧数据同步...");
+            _logger.Info("开始初始化旧数据同步...");
             var startTime = DateTime.Now;
 
             var enabledTables = _tableConfigs.Where(t => t.Enabled && t.InitializeExistingData).ToList();
             
             if (!enabledTables.Any())
             {
-                Console.WriteLine("没有需要初始化的表");
+                _logger.Info("没有需要初始化的表");
                 return;
             }
 
-            Console.WriteLine($"共有 {enabledTables.Count} 个表需要初始化，并发度: {(parallel ? maxConcurrency : 1)}");
+            _logger.Info($"共有 {enabledTables.Count} 个表需要初始化，并发度: {(parallel ? maxConcurrency : 1)}");
 
             if (parallel)
             {
@@ -153,12 +172,12 @@ namespace DatabaseReplication.Follower
                             {
                                 completedTables++;
                                 var progress = (double)completedTables / totalTables * 100;
-                                Console.WriteLine($"进度: {completedTables}/{totalTables} ({progress:F1}%) - 表 {tableConfig.TableName} 初始化完成");
+                                _logger.Info($"进度: {completedTables}/{totalTables} ({progress:F1}%) - 表 {tableConfig.TableName} 初始化完成");
                             }
                         }
                         catch (Exception ex)
                         {
-                            Console.WriteLine($"表 {tableConfig.TableName} 初始化失败: {ex.Message}");
+                            _logger.Error($"表 {tableConfig.TableName} 初始化失败: {ex.Message}");
                             throw;
                         }
                         finally
@@ -172,17 +191,17 @@ namespace DatabaseReplication.Follower
                 try
                 {
                     await Task.WhenAll(tasks);
-                    Console.WriteLine("所有表初始化成功完成");
+                    _logger.Info("所有表初始化成功完成");
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"部分表初始化失败: {ex.Message}");
+                    _logger.Error($"部分表初始化失败: {ex.Message}");
                     // 检查哪些任务失败了
                     for (int i = 0; i < tasks.Count; i++)
                     {
                         if (tasks[i].IsFaulted)
                         {
-                            Console.WriteLine($"表 {enabledTables[i].TableName} 初始化失败: {tasks[i].Exception?.GetBaseException().Message}");
+                            _logger.Error($"表 {enabledTables[i].TableName} 初始化失败: {tasks[i].Exception?.GetBaseException().Message}");
                         }
                     }
                     throw;
@@ -198,18 +217,18 @@ namespace DatabaseReplication.Follower
                     {
                         await InitializeTableDataWithRetry(tableConfig);
                         var progress = (double)(i + 1) / enabledTables.Count * 100;
-                        Console.WriteLine($"进度: {i + 1}/{enabledTables.Count} ({progress:F1}%) - 表 {tableConfig.TableName} 初始化完成");
+                        _logger.Info($"进度: {i + 1}/{enabledTables.Count} ({progress:F1}%) - 表 {tableConfig.TableName} 初始化完成");
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"表 {tableConfig.TableName} 初始化失败: {ex.Message}");
+                        _logger.Error($"表 {tableConfig.TableName} 初始化失败: {ex.Message}");
                         throw;
                     }
                 }
             }
 
             var duration = DateTime.Now - startTime;
-            Console.WriteLine($"旧数据初始化同步完成，总耗时: {duration.TotalMinutes:F2} 分钟");
+            _logger.Info($"旧数据初始化同步完成，总耗时: {duration.TotalMinutes:F2} 分钟");
         }
 
         // 带重试机制的表数据初始化
@@ -229,12 +248,12 @@ namespace DatabaseReplication.Follower
                 {
                     retryCount++;
                     var delay = TimeSpan.FromMilliseconds(baseDelay.TotalMilliseconds * Math.Pow(2, retryCount - 1));
-                    Console.WriteLine($"表 {tableConfig.TableName} 初始化失败 (第 {retryCount} 次重试)，{delay.TotalSeconds} 秒后重试: {ex.Message}");
+                    _logger.Warning($"表 {tableConfig.TableName} 初始化失败 (第 {retryCount} 次重试)，{delay.TotalSeconds} 秒后重试: {ex.Message}");
                     await Task.Delay(delay);
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"表 {tableConfig.TableName} 初始化最终失败，已重试 {maxRetries} 次: {ex.Message}");
+                    _logger.Error($"表 {tableConfig.TableName} 初始化最终失败，已重试 {maxRetries} 次: {ex.Message}");
                     throw;
                 }
             }
@@ -243,12 +262,12 @@ namespace DatabaseReplication.Follower
         // 初始化单个表的旧数据
         private async Task InitializeTableData(TableConfig tableConfig)
         {
-            Console.WriteLine($"开始初始化表 {tableConfig.TableName} 的旧数据...");
+            _logger.Info($"开始初始化表 {tableConfig.TableName} 的旧数据...");
 
             await ClearTableData(tableConfig);
             await CopyTableData(tableConfig);
 
-            Console.WriteLine($"表 {tableConfig.TableName} 的旧数据初始化完成");
+            _logger.Info($"表 {tableConfig.TableName} 的旧数据初始化完成");
         }
         // 创建复制状态表
         private void CreateReplicationStatusTable()
@@ -276,7 +295,7 @@ namespace DatabaseReplication.Follower
         {
             await ExecuteWithRetry(async () =>
             {
-                Console.WriteLine($"清空从库 {_followerConnectionString} 中表 {tableConfig.TableName} 的数据...");
+                _logger.Info($"清空从库 {_followerConnectionString} 中表 {tableConfig.TableName} 的数据...");
 
                 using (var connection = new MySqlConnection(_followerConnectionString))
                 {
@@ -306,7 +325,7 @@ namespace DatabaseReplication.Follower
         // 复制表数据
         private async Task CopyTableData(TableConfig tableConfig, int maxConcurrency = 4)
         {
-            Console.WriteLine($"从 {_leaderConnectionString} 复制表 {tableConfig.TableName} 数据到 {_followerConnectionString}...");
+            _logger.Info($"从 {_leaderConnectionString} 复制表 {tableConfig.TableName} 数据到 {_followerConnectionString}...");
 
             using (var sourceConnection = new MySqlConnection(_leaderConnectionString))
             {
@@ -315,7 +334,7 @@ namespace DatabaseReplication.Follower
                 // 获取表结构信息
                 var columns = new List<string>();
                 await using (var schemaCmd = new MySqlCommand(
-                    $"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @TableName AND TABLE_SCHEMA = DATABASE()",
+                    $"SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_NAME = @TableName AND TABLE_SCHEMA = DATABASE()",
                     sourceConnection))
                 {
                     schemaCmd.Parameters.AddWithValue("@TableName", tableConfig.TableName);
@@ -338,7 +357,7 @@ namespace DatabaseReplication.Follower
                     totalRows = Convert.ToInt32(await countCmd.ExecuteScalarAsync());
                 }
 
-                Console.WriteLine($"表 {tableConfig.TableName} 共有 {totalRows} 条记录需要复制");
+                _logger.Info($"表 {tableConfig.TableName} 共有 {totalRows} 条记录需要复制");
 
                 int batchSize = 5000;
                 var batches = new List<(int offset, int size, int batchNumber)>();
@@ -350,7 +369,7 @@ namespace DatabaseReplication.Follower
                     batches.Add((offset, currentBatchSize, batches.Count + 1));
                 }
 
-                Console.WriteLine($"表 {tableConfig.TableName} 将分为 {batches.Count} 个批次进行并行复制，并发度: {maxConcurrency}");
+                _logger.Info($"表 {tableConfig.TableName} 将分为 {batches.Count} 个批次进行并行复制，并发度: {maxConcurrency}");
 
                 // 使用 SemaphoreSlim 控制并发数量
                 using var semaphore = new SemaphoreSlim(maxConcurrency, maxConcurrency);
@@ -373,12 +392,12 @@ namespace DatabaseReplication.Follower
                                 completedBatches++;
                                 totalCopiedRows += copiedRows;
                                 var progress = (double)completedBatches / batches.Count * 100;
-                                Console.WriteLine($"批次进度: {completedBatches}/{batches.Count} ({progress:F1}%) - 批次 {batchNumber} 完成，复制了 {copiedRows} 条记录");
+                                _logger.Info($"批次进度: {completedBatches}/{batches.Count} ({progress:F1}%) - 批次 {batchNumber} 完成，复制了 {copiedRows} 条记录");
                             }
                         }
                         catch (Exception ex)
                         {
-                            Console.WriteLine($"批次 {batchNumber} 复制失败: {ex.Message}");
+                            _logger.Error($"批次 {batchNumber} 复制失败: {ex.Message}");
                             throw;
                         }
                         finally
@@ -392,11 +411,11 @@ namespace DatabaseReplication.Follower
                 try
                 {
                     await Task.WhenAll(tasks);
-                    Console.WriteLine($"表 {tableConfig.TableName} 所有批次复制完成，共复制 {totalCopiedRows} 条记录");
+                    _logger.Info($"表 {tableConfig.TableName} 所有批次复制完成，共复制 {totalCopiedRows} 条记录");
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"表 {tableConfig.TableName} 部分批次复制失败: {ex.Message}");
+                    _logger.Error($"表 {tableConfig.TableName} 部分批次复制失败: {ex.Message}");
                     throw;
                 }
             }
@@ -416,17 +435,17 @@ namespace DatabaseReplication.Follower
                 catch (Exception ex)
                 {
                     lastException = ex;
-                    Console.WriteLine($"{operationName} 第 {attempt} 次尝试失败: {ex.Message}");
+                    _logger.Warning($"{operationName} 第 {attempt} 次尝试失败: {ex.Message}");
                     
                     if (attempt == maxRetries)
                     {
-                        Console.WriteLine($"{operationName} 达到最大重试次数 ({maxRetries})，操作失败");
+                        _logger.Error($"{operationName} 达到最大重试次数 ({maxRetries})，操作失败");
                         throw;
                     }
                     
                     // 指数退避策略
                     int delay = delayMs * (int)Math.Pow(2, attempt - 1);
-                    Console.WriteLine($"等待 {delay}ms 后进行第 {attempt + 1} 次重试...");
+                    _logger.Info($"等待 {delay}ms 后进行第 {attempt + 1} 次重试...");
                     await Task.Delay(delay);
                 }
             }
@@ -448,17 +467,17 @@ namespace DatabaseReplication.Follower
                 catch (Exception ex)
                 {
                     lastException = ex;
-                    Console.WriteLine($"{operationName} 第 {attempt} 次尝试失败: {ex.Message}");
+                    _logger.Warning($"{operationName} 第 {attempt} 次尝试失败: {ex.Message}");
 
                     if (attempt == maxRetries)
                     {
-                        Console.WriteLine($"{operationName} 达到最大重试次数 ({maxRetries})，操作失败");
+                        _logger.Error($"{operationName} 达到最大重试次数 ({maxRetries})，操作失败");
                         throw;
                     }
 
                     // 指数退避策略
                     int delay = delayMs * (int)Math.Pow(2, attempt - 1);
-                    Console.WriteLine($"等待 {delay}ms 后进行第 {attempt + 1} 次重试...");
+                    _logger.Info($"等待 {delay}ms 后进行第 {attempt + 1} 次重试...");
                     await Task.Delay(delay);
                 }
             }
@@ -489,29 +508,46 @@ namespace DatabaseReplication.Follower
                                 {
                                     await destinationConnection.OpenAsync();
 
-                                    // 使用 MySqlBulkLoader 进行批量插入
-                                    var bulkLoader = new MySqlBulkLoader(destinationConnection)
+                                    // 设置会话变量防止触发器在批量加载时触发
+                                    await using (var setCmd = new MySqlCommand("SET @is_replicating = 1", destinationConnection))
                                     {
-                                        TableName = tableConfig.TableName,
-                                        CharacterSet = "utf8mb4",
-                                        NumberOfLinesToSkip = 0,
-                                        Timeout = 300, // 5分钟超时
-                                        FieldTerminator = ",",
-                                        LineTerminator = Environment.NewLine,
-                                        FieldQuotationCharacter = '"',
-                                        FieldQuotationOptional = false
-                                    };
-
-                                    // 添加列映射
-                                    foreach (var column in columns)
-                                    {
-                                        bulkLoader.Columns.Add(column);
+                                        await setCmd.ExecuteNonQueryAsync();
                                     }
 
-                                    // 将 DataReader 转换为 CSV 格式并加载
-                                    bulkLoader.SourceStream = new DataReaderStream(reader);
-                                    var rowsLoaded = await bulkLoader.LoadAsync();
-                                    return (int)rowsLoaded;
+                                    try
+                                    {
+                                        // 使用 MySqlBulkLoader 进行批量插入
+                                        var bulkLoader = new MySqlBulkLoader(destinationConnection)
+                                        {
+                                            TableName = tableConfig.TableName,
+                                            CharacterSet = "utf8mb4",
+                                            NumberOfLinesToSkip = 0,
+                                            Timeout = 300, // 5分钟超时
+                                            FieldTerminator = ",",
+                                            LineTerminator = Environment.NewLine,
+                                            FieldQuotationCharacter = '"',
+                                            FieldQuotationOptional = false
+                                        };
+
+                                        // 添加列映射
+                                        foreach (var column in columns)
+                                        {
+                                            bulkLoader.Columns.Add(column);
+                                        }
+
+                                        // 将 DataReader 转换为 CSV 格式并加载
+                                        bulkLoader.SourceStream = new DataReaderStream(reader);
+                                        var rowsLoaded = await bulkLoader.LoadAsync();
+                                        return (int)rowsLoaded;
+                                    }
+                                    finally
+                                    {
+                                        // 重置会话变量
+                                        await using (var resetCmd = new MySqlCommand("SET @is_replicating = 0", destinationConnection))
+                                        {
+                                            await resetCmd.ExecuteNonQueryAsync();
+                                        }
+                                    }
                                 }
                             }
                             return 0;
@@ -620,7 +656,7 @@ namespace DatabaseReplication.Follower
 
                     if (pendingChanges.Any())
                     {
-                        Console.WriteLine($"从主库拉取了 {pendingChanges.Count} 条表 {tableConfig.TableName} 的变更");
+                        _logger.Info($"从主库拉取了 {pendingChanges.Count} 条表 {tableConfig.TableName} 的变更");
 
                         // 应用变更到从库
                         await ApplyChangesToFollower(followerContext, tableConfig, pendingChanges);
@@ -628,7 +664,7 @@ namespace DatabaseReplication.Follower
                         // 标记变更为已处理
                         await MarkChangesAsProcessed(leaderContext, pendingChanges);
 
-                        Console.WriteLine($"成功将 {pendingChanges.Count} 条表 {tableConfig.TableName} 的变更应用到从库");
+                        _logger.Info($"成功将 {pendingChanges.Count} 条表 {tableConfig.TableName} 的变更应用到从库");
                     }
                 }
                 return Task.CompletedTask;
@@ -682,7 +718,7 @@ namespace DatabaseReplication.Follower
                         
                         if (conflicts.Any())
                         {
-                            Console.WriteLine($"检测到 {conflicts.Count} 个冲突，开始解决冲突...");
+                            _logger.Warning($"检测到 {conflicts.Count} 个冲突，开始解决冲突...");
                             
                             // 解决冲突
                             var resolvedChanges = new List<ReplicationLogEntry>();
@@ -705,11 +741,11 @@ namespace DatabaseReplication.Follower
                         }
                     }
 
+                    // 批量操作开始时设置会话变量防止从库触发器递归
+                    await followerContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 1");
+
                     foreach (var change in changes)
                     {
-                        // 设置会话变量防止从库触发器递归
-                        await followerContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 1");
-
                         // 通过主键从主库获取完整实体
                         var entity = await GetEntityFromLeader(tableConfig, change.Data);
 
@@ -723,17 +759,18 @@ namespace DatabaseReplication.Follower
                             // 对于删除操作，如果实体不存在，直接执行删除
                             await DeleteEntityInFollower(followerContext, tableConfig, change.Data);
                         }
-
-                        await followerContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 0");
                     }
 
                     await followerContext.SaveChangesAsync();
+                    
+                    // 批量操作完成后重置会话变量
+                    await followerContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 0");
                     await transaction.CommitAsync();
                 }
                 catch (Exception ex)
                 {
                     await transaction.RollbackAsync();
-                    Console.WriteLine($"应用变更到从库时出错: {ex.Message}");
+                    _logger.Error($"应用变更到从库时出错: {ex.Message}");
                     throw;
                 }
             }, 3, 1000, $"应用变更到从库 - 表 {tableConfig.TableName}");
@@ -823,7 +860,7 @@ namespace DatabaseReplication.Follower
                             dbSet.Add(typedEntity);
                         }
                     }
-                    Console.WriteLine($"在从库插入表 {tableConfig.TableName} 记录 {log.Data}");
+                    _logger.Info($"在从库插入表 {tableConfig.TableName} 记录 {log.Data}");
                     break;
 
                 case ReplicationOperation.Update:
@@ -841,7 +878,7 @@ namespace DatabaseReplication.Follower
                             followerContext.Entry(existingEntity).Property(tableConfig.PrimaryKey).IsModified = false;
                         }
 
-                        Console.WriteLine($"在从库更新表 {tableConfig.TableName} 记录 {log.Data}");
+                        _logger.Info($"在从库更新表 {tableConfig.TableName} 记录 {log.Data}");
                     }
                     else
                     {
@@ -853,7 +890,7 @@ namespace DatabaseReplication.Follower
                             followerContext.Entry(trackedEntity).State = EntityState.Detached;
                         }
                         dbSet.Add(typedEntity);
-                        Console.WriteLine($"在从库中记录不存在，将更新操作转换为插入操作 - 表 {tableConfig.TableName} 记录 {log.Data}");
+                        _logger.Info($"在从库中记录不存在，将更新操作转换为插入操作 - 表 {tableConfig.TableName} 记录 {log.Data}");
                     }
                     break;
 
@@ -863,7 +900,7 @@ namespace DatabaseReplication.Follower
                     if (entityToDelete != null)
                     {
                         dbSet.Remove(entityToDelete);
-                        Console.WriteLine($"在从库删除表 {tableConfig.TableName} 记录 {log.Data}");
+                        _logger.Info($"在从库删除表 {tableConfig.TableName} 记录 {log.Data}");
                     }
                     else
                     {
@@ -871,7 +908,7 @@ namespace DatabaseReplication.Follower
                         var deleteEntity = Activator.CreateInstance(tableConfig.EntityType);
                         primaryKeyProperty.SetValue(deleteEntity, primaryKeyValue);
                         followerContext.Entry(deleteEntity).State = EntityState.Deleted;
-                        Console.WriteLine($"在从库删除表 {tableConfig.TableName} 记录 {log.Data}（实体不存在，创建删除标记）");
+                        _logger.Info($"在从库删除表 {tableConfig.TableName} 记录 {log.Data}（实体不存在，创建删除标记）");
                     }
                     break;
             }
@@ -983,7 +1020,7 @@ namespace DatabaseReplication.Follower
 
                 string sql = $@"
                     SELECT EXTRA 
-                    FROM INFORMATION_SCHEMA.COLUMNS 
+                    FROM information_schema.COLUMNS 
                     WHERE TABLE_NAME = @TableName 
                       AND COLUMN_NAME = @PrimaryKey
                       AND TABLE_SCHEMA = DATABASE()";
@@ -1045,11 +1082,65 @@ namespace DatabaseReplication.Follower
                     catch (Exception ex)
                     {
                         await transaction.RollbackAsync();
-                        Console.WriteLine($"标记变更为已处理时出错: {ex.Message}");
+                        _logger.Error($"标记变更为已处理时出错: {ex.Message}");
                         throw;
                     }
                 }
             }, 3, 1000, "标记变更为已处理");
+        }
+
+        // 带执行状态控制的方法包装器
+        private async Task ExecuteWithFlag(string timerKey, Func<Task> action)
+        {
+            lock (_executionLock)
+            {
+                if (_executionFlags[timerKey])
+                {
+                    _logger.Info($"定时器 {timerKey} 正在执行中，跳过本次执行");
+                    return;
+                }
+                _executionFlags[timerKey] = true;
+            }
+
+            try
+            {
+                await action();
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"定时器 {timerKey} 执行出错: {ex.Message}");
+            }
+            finally
+            {
+                lock (_executionLock)
+                {
+                    _executionFlags[timerKey] = false;
+                }
+            }
+        }
+
+        // 带执行状态控制的清理方法
+        private async Task ExecuteCleanupWithFlag()
+        {
+            if (_isCleanupExecuting)
+            {
+                _logger.Info("数据清理任务正在执行中，跳过本次执行");
+                return;
+            }
+
+            _isCleanupExecuting = true;
+            try
+            {
+                await CleanupOldReplicationLogs();
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"数据清理任务执行出错: {ex.Message}");
+            }
+            finally
+            {
+                _isCleanupExecuting = false;
+            }
         }
 
         // 从库向主库同步变更
@@ -1065,7 +1156,7 @@ namespace DatabaseReplication.Follower
 
                     if (pendingChanges.Any())
                     {
-                        Console.WriteLine($"从从库拉取了 {pendingChanges.Count} 条表 {tableConfig.TableName} 的变更，准备推送到主库");
+                        _logger.Info($"从从库拉取了 {pendingChanges.Count} 条表 {tableConfig.TableName} 的变更，准备推送到主库");
 
                         // 应用变更到主库
                         await ApplyChangesToLeader(leaderContext, tableConfig, pendingChanges);
@@ -1073,13 +1164,13 @@ namespace DatabaseReplication.Follower
                         // 标记变更为已处理
                         await MarkFollowerChangesAsProcessed(followerContext, pendingChanges);
 
-                        Console.WriteLine($"成功将 {pendingChanges.Count} 条表 {tableConfig.TableName} 的变更推送到主库");
+                        _logger.Info($"成功将 {pendingChanges.Count} 条表 {tableConfig.TableName} 的变更推送到主库");
                     }
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"推送从库变更到主库时出错: {ex.Message}");
+                _logger.Error($"推送从库变更到主库时出错: {ex.Message}");
             }
         }
 
@@ -1116,11 +1207,11 @@ namespace DatabaseReplication.Follower
 
                 try
                 {
+                    // 批量操作开始时设置会话变量防止主库触发器递归
+                    await leaderContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 1");
+
                     foreach (var change in changes)
                     {
-                        // 设置会话变量防止主库触发器递归
-                        await leaderContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 1");
-
                         // 通过主键从从库获取完整实体
                         var entity = await GetEntityFromFollower(tableConfig, change.Data);
 
@@ -1134,31 +1225,18 @@ namespace DatabaseReplication.Follower
                             // 对于删除操作，如果实体不存在，直接执行删除
                             await DeleteEntityInLeader(leaderContext, tableConfig, change.Data);
                         }
-
-                        // 记录主库已处理的变更
-                        leaderContext.ReplicationLogs.Add(new ReplicationLogEntry
-                        {
-                            TableName = change.TableName,
-                            OperationType = change.OperationType,
-                            RecordId = change.RecordId,
-                            Data = change.Data,
-                            Timestamp = DateTime.UtcNow,
-                            Processed = true,
-                            Direction =ReplicationDirection.FollowerToLeader,
-                            SourceServer = _followerServerId,
-                            OperationId = Guid.NewGuid()
-                        });
-
-                        await leaderContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 0");
                     }
 
                     await leaderContext.SaveChangesAsync();
+                    
+                    // 批量操作完成后重置会话变量
+                    await leaderContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 0");
                     await transaction.CommitAsync();
                 }
                 catch (Exception ex)
                 {
                     await transaction.RollbackAsync();
-                    Console.WriteLine($"应用变更到主库时出错: {ex.Message}");
+                    _logger.Error($"应用变更到主库时出错: {ex.Message}");
                     throw;
                 }
             }, 3, 1000, $"应用变更到主库 - 表 {tableConfig.TableName}");
@@ -1194,13 +1272,14 @@ namespace DatabaseReplication.Follower
             dynamic dbSet = genericSetMethod.Invoke(leaderContext, null);
 
             // 安全地转换实体类型
-            var typedEntity = ConvertToTypedEntity(entity, tableConfig.EntityType);
+            dynamic typedEntity = ConvertToTypedEntity(entity, tableConfig.EntityType);
             var primaryKeyProperty = tableConfig.EntityType.GetProperty(tableConfig.PrimaryKey);
             var primaryKeyValue = primaryKeyProperty.GetValue(typedEntity);
 
             switch (log.OperationType)
             {
                 case ReplicationOperation.Insert:
+
                     // 检查是否已经被跟踪
                     var trackedInsertEntity = leaderContext.Entry(typedEntity).Entity;
                     if (leaderContext.Entry(trackedInsertEntity).State == EntityState.Detached)
@@ -1221,7 +1300,7 @@ namespace DatabaseReplication.Follower
                             dbSet.Add(typedEntity);
                         }
                     }
-                    Console.WriteLine($"在主库插入表 {tableConfig.TableName} 记录 {log.Data}（来自从库 {_followerServerId}）");
+                    _logger.Info($"在主库插入表 {tableConfig.TableName} 记录 {log.Data}（来自从库 {_followerServerId}）");
                     break;
 
                 case ReplicationOperation.Update:
@@ -1239,7 +1318,7 @@ namespace DatabaseReplication.Follower
                             leaderContext.Entry(existingEntity).Property(tableConfig.PrimaryKey).IsModified = false;
                         }
 
-                        Console.WriteLine($"在主库更新表 {tableConfig.TableName} 记录 {log.Data}（来自从库 {_followerServerId}）");
+                        _logger.Info($"在主库更新表 {tableConfig.TableName} 记录 {log.Data}（来自从库 {_followerServerId}）");
                     }
                     else
                     {
@@ -1251,7 +1330,7 @@ namespace DatabaseReplication.Follower
                             leaderContext.Entry(trackedEntity).State = EntityState.Detached;
                         }
                         dbSet.Add(typedEntity);
-                        Console.WriteLine($"在主库中记录不存在，将更新操作转换为插入操作 - 表 {tableConfig.TableName} 记录 {log.Data}（来自从库 {_followerServerId}）");
+                        _logger.Info($"在主库中记录不存在，将更新操作转换为插入操作 - 表 {tableConfig.TableName} 记录 {log.Data}（来自从库 {_followerServerId}）");
                     }
                     break;
 
@@ -1261,7 +1340,7 @@ namespace DatabaseReplication.Follower
                     if (entityToDelete != null)
                     {
                         dbSet.Remove(entityToDelete);
-                        Console.WriteLine($"在主库删除表 {tableConfig.TableName} 记录 {log.Data}（来自从库 {_followerServerId}）");
+                        _logger.Info($"在主库删除表 {tableConfig.TableName} 记录 {log.Data}（来自从库 {_followerServerId}）");
                     }
                     else
                     {
@@ -1269,7 +1348,7 @@ namespace DatabaseReplication.Follower
                         var deleteEntity = Activator.CreateInstance(tableConfig.EntityType);
                         primaryKeyProperty.SetValue(deleteEntity, primaryKeyValue);
                         leaderContext.Entry(deleteEntity).State = EntityState.Deleted;
-                        Console.WriteLine($"在主库删除表 {tableConfig.TableName} 记录 {log.Data}（实体不存在，创建删除标记）（来自从库 {_followerServerId}）");
+                        _logger.Info($"在主库删除表 {tableConfig.TableName} 记录 {log.Data}（实体不存在，创建删除标记）（来自从库 {_followerServerId}）");
                     }
                     break;
             }
@@ -1337,7 +1416,7 @@ namespace DatabaseReplication.Follower
                     catch (Exception ex)
                     {
                         await transaction.RollbackAsync();
-                        Console.WriteLine($"标记从库变更为已处理时出错: {ex.Message}");
+                        _logger.Error($"标记从库变更为已处理时出错: {ex.Message}");
                         throw;
                     }
                 }
@@ -1372,7 +1451,7 @@ namespace DatabaseReplication.Follower
         {
             try
             {
-                Console.WriteLine($"开始清理 {_dataRetentionDays} 天前的复制日志数据...");
+                _logger.Info($"开始清理 {_dataRetentionDays} 天前的复制日志数据...");
                 var cutoffDate = DateTime.Now.AddDays(-_dataRetentionDays);
                 
                 // 清理主库的复制日志
@@ -1381,11 +1460,11 @@ namespace DatabaseReplication.Follower
                 // 清理从库的复制日志
                 await CleanupReplicationLogsInDatabase("从库", () => CreateFollowerDbContext(), cutoffDate);
                 
-                Console.WriteLine($"复制日志清理完成，已删除 {cutoffDate:yyyy-MM-dd HH:mm:ss} 之前的数据");
+                _logger.Info($"复制日志清理完成，已删除 {cutoffDate:yyyy-MM-dd HH:mm:ss} 之前的数据");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"清理复制日志时出错: {ex.Message}");
+                _logger.Error($"清理复制日志时出错: {ex.Message}");
             }
         }
 
@@ -1404,14 +1483,14 @@ namespace DatabaseReplication.Follower
                 command.Parameters.AddWithValue("@CutoffDate", cutoffDate);
                 
                 var deletedCount = await command.ExecuteNonQueryAsync();
-                Console.WriteLine($"{dbName} - 已删除 {deletedCount} 条过期的复制日志记录");
+                _logger.Info($"{dbName} - 已删除 {deletedCount} 条过期的复制日志记录");
                 
                 // 清理复制状态表（如果存在）
                 await CleanupReplicationStatusTables(connection, cutoffDate, dbName);
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"清理 {dbName} 复制日志时出错: {ex.Message}");
+                _logger.Error($"清理 {dbName} 复制日志时出错: {ex.Message}");
             }
         }
 
@@ -1455,19 +1534,19 @@ namespace DatabaseReplication.Follower
                             var deletedStatusCount = await deleteCommand.ExecuteNonQueryAsync();
                             if (deletedStatusCount > 0)
                             {
-                                Console.WriteLine($"{dbName} - 已删除 {deletedStatusCount} 条过期的复制状态记录 (表: {tableName})");
+                                _logger.Info($"{dbName} - 已删除 {deletedStatusCount} 条过期的复制状态记录 (表: {tableName})");
                             }
                         }
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"清理状态表 {tableName} 时出错: {ex.Message}");
+                        _logger.Error($"清理状态表 {tableName} 时出错: {ex.Message}");
                     }
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"清理 {dbName} 复制状态表时出错: {ex.Message}");
+                _logger.Error($"清理 {dbName} 复制状态表时出错: {ex.Message}");
             }
         }
 
@@ -1506,7 +1585,7 @@ namespace DatabaseReplication.Follower
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"检测冲突时出错: {ex.Message}");
+                _logger.Error($"检测冲突时出错: {ex.Message}");
             }
             
             return conflicts;
@@ -1589,7 +1668,7 @@ namespace DatabaseReplication.Follower
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"获取冲突字段时出错: {ex.Message}");
+                _logger.Error($"获取冲突字段时出错: {ex.Message}");
             }
             
             return conflictingFields;
@@ -1632,7 +1711,7 @@ namespace DatabaseReplication.Follower
                     case ConflictResolutionStrategy.ManualReview:
                         conflict.Resolution = ConflictResolutionResult.RequiresManualReview;
                         conflict.ResolutionReason = "需要人工审核";
-                        Console.WriteLine($"冲突需要人工审核: 表 {conflict.TableName}, 记录 {conflict.RecordId}");
+                        _logger.Warning($"冲突需要人工审核: 表 {conflict.TableName}, 记录 {conflict.RecordId}");
                         return null;
                         
                     default:
@@ -1642,7 +1721,7 @@ namespace DatabaseReplication.Follower
                 if (resolvedEntry != null)
                 {
                     conflict.Resolution = ConflictResolutionResult.ResolvedAutomatically;
-                    Console.WriteLine($"冲突已自动解决: 表 {conflict.TableName}, 记录 {conflict.RecordId}, 策略: {tableConfig.ConflictStrategy}");
+                    _logger.Info($"冲突已自动解决: 表 {conflict.TableName}, 记录 {conflict.RecordId}, 策略: {tableConfig.ConflictStrategy}");
                 }
                 else
                 {
@@ -1654,7 +1733,7 @@ namespace DatabaseReplication.Follower
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"解决冲突时出错: {ex.Message}");
+                _logger.Error($"解决冲突时出错: {ex.Message}");
                 conflict.Resolution = ConflictResolutionResult.Failed;
                 conflict.ResolutionReason = $"解决时出错: {ex.Message}";
                 return null;
@@ -1729,7 +1808,7 @@ namespace DatabaseReplication.Follower
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"最后写入获胜策略执行时出错: {ex.Message}");
+                _logger.Error($"最后写入获胜策略执行时出错: {ex.Message}");
                 // 出错时回退到简单的时间戳比较
                 return conflict.SourceEntry.Timestamp > conflict.TargetEntry.Timestamp ? 
                        conflict.SourceEntry : conflict.TargetEntry;
@@ -1936,7 +2015,7 @@ namespace DatabaseReplication.Follower
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"记录冲突日志时出错: {ex.Message}");
+                _logger.Error($"记录冲突日志时出错: {ex.Message}");
             }
         }
 
@@ -1986,7 +2065,7 @@ namespace DatabaseReplication.Follower
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"检测同步间隙时出错: {ex.Message}");
+                _logger.Error($"检测同步间隙时出错: {ex.Message}");
             }
             
             return detection;
@@ -2023,7 +2102,7 @@ namespace DatabaseReplication.Follower
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"检测表 {tableConfig.TableName} 同步间隙时出错: {ex.Message}");
+                _logger.Error($"检测表 {tableConfig.TableName} 同步间隙时出错: {ex.Message}");
             }
             
             return null;
@@ -2053,7 +2132,7 @@ namespace DatabaseReplication.Follower
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"获取最后同步时间时出错: {ex.Message}");
+                _logger.Error($"获取最后同步时间时出错: {ex.Message}");
                 return DateTime.MinValue;
             }
         }
@@ -2063,23 +2142,23 @@ namespace DatabaseReplication.Follower
         {
             try
             {
-                Console.WriteLine("检测网络恢复，开始同步间隙检测...");
+                _logger.Info("检测网络恢复，开始同步间隙检测...");
                 
                 var gapDetection = await DetectSynchronizationGaps();
                 
                 if (gapDetection.HasGaps)
                 {
-                    Console.WriteLine($"检测到同步间隙，共 {gapDetection.MissedOperationsCount} 个未同步操作");
+                    _logger.Warning($"检测到同步间隙，共 {gapDetection.MissedOperationsCount} 个未同步操作");
                     await RecoverFromSynchronizationGap(gapDetection);
                 }
                 else
                 {
-                    Console.WriteLine("未检测到同步间隙，数据同步正常");
+                    _logger.Info("未检测到同步间隙，数据同步正常");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"网络恢复处理时出错: {ex.Message}");
+                _logger.Error($"网络恢复处理时出错: {ex.Message}");
             }
         }
 
@@ -2090,7 +2169,7 @@ namespace DatabaseReplication.Follower
             {
                 foreach (var gap in gapDetection.Gaps)
                 {
-                    Console.WriteLine($"开始恢复表 {gap.TableName} 的同步间隙，时间范围: {gap.StartTime:yyyy-MM-dd HH:mm:ss} - {gap.EndTime:yyyy-MM-dd HH:mm:ss}");
+                    _logger.Info($"开始恢复表 {gap.TableName} 的同步间隙，时间范围: {gap.StartTime:yyyy-MM-dd HH:mm:ss} - {gap.EndTime:yyyy-MM-dd HH:mm:ss}");
                     
                     var tableConfig = _tableConfigs.FirstOrDefault(t => t.TableName == gap.TableName);
                     if (tableConfig != null)
@@ -2102,7 +2181,7 @@ namespace DatabaseReplication.Follower
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"从同步间隙恢复时出错: {ex.Message}");
+                _logger.Error($"从同步间隙恢复时出错: {ex.Message}");
             }
         }
 
@@ -2124,7 +2203,7 @@ namespace DatabaseReplication.Follower
                 
                 if (missedChanges.Any())
                 {
-                    Console.WriteLine($"开始强制同步表 {tableConfig.TableName} 的 {missedChanges.Count} 个变更");
+                    _logger.Info($"开始强制同步表 {tableConfig.TableName} 的 {missedChanges.Count} 个变更");
                     
                     // 分批处理
                     var batches = missedChanges.Chunk(_batchSize);
@@ -2134,12 +2213,12 @@ namespace DatabaseReplication.Follower
                         await MarkChangesAsProcessed(leaderContext, batch.ToList());
                     }
                     
-                    Console.WriteLine($"表 {tableConfig.TableName} 强制同步完成");
+                    _logger.Info($"表 {tableConfig.TableName} 强制同步完成");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"强制同步表 {tableConfig.TableName} 时出错: {ex.Message}");
+                _logger.Error($"强制同步表 {tableConfig.TableName} 时出错: {ex.Message}");
             }
         }
 

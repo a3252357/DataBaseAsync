@@ -1,5 +1,4 @@
-﻿
-using Microsoft.EntityFrameworkCore.Storage.Internal;
+﻿using Microsoft.EntityFrameworkCore.Storage.Internal;
 using System;
 using System.ComponentModel.DataAnnotations;
 using System.ComponentModel.DataAnnotations.Schema;
@@ -173,6 +172,11 @@ namespace Coldairarrow.bgmj.Entity
         /// 人员状态
         /// </summary>
         public String gsbz { get; set; }
+
+        /// <summary>
+        /// 工号
+        /// </summary>
+        public Int32 EmployeeNo { get; set; }
 
         /// <summary>
         /// 中间表Id
