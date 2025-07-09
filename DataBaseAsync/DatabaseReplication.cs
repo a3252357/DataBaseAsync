@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.ComponentModel.DataAnnotations.Schema;
@@ -108,7 +108,7 @@ namespace DatabaseReplication
         public string FollowerServer { get; set; }
         public ReplicationLogEntry SourceEntry { get; set; }
         public ReplicationLogEntry TargetEntry { get; set; }
-        public DateTime DetectedAt { get; set; } = DateTime.UtcNow;
+        public DateTime DetectedAt { get; set; } = DateTime.Now;
         public ConflictType Type { get; set; }
         public ConflictResolutionResult Resolution { get; set; }
         public string ResolutionReason { get; set; }
@@ -148,5 +148,35 @@ namespace DatabaseReplication
         public DateTime EndTime { get; set; }
         public int MissedOperations { get; set; }
         public string Reason { get; set; }
+    }
+
+    // 复制失败日志
+    public class ReplicationFailureLog
+    {
+        public int Id { get; set; }
+        public string TableName { get; set; }
+        public ReplicationOperation OperationType { get; set; }
+        public string RecordId { get; set; }
+        public string Data { get; set; }
+        public DateTime OriginalTimestamp { get; set; }
+        public DateTime FailedAt { get; set; }
+        public int RetryCount { get; set; }
+        public string ErrorMessage { get; set; }
+        public string SourceServer { get; set; }
+        public Guid OriginalOperationId { get; set; }
+        public ReplicationDirection Direction { get; set; }
+    }
+
+    // 同步进度记录
+    public class SyncProgress
+    {
+        public int Id { get; set; }
+        public string TableName { get; set; }
+        public string SourceServer { get; set; }
+        public string TargetServer { get; set; }
+        public int LastSyncedLogId { get; set; }
+        public DateTime LastSyncTime { get; set; }
+        public ReplicationDirection Direction { get; set; }
+        public bool IsActive { get; set; } = true;
     }
 }

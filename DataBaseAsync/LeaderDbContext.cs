@@ -29,6 +29,8 @@ namespace DatabaseReplication
         }
 
         public DbSet<ReplicationLogEntry> ReplicationLogs { get; set; }
+        public DbSet<ReplicationFailureLog> ReplicationFailureLogs { get; set; }
+        public DbSet<SyncProgress> SyncProgresses { get; set; }
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
@@ -77,6 +79,43 @@ namespace DatabaseReplication
                 entity.Property(e => e.SourceServer).HasColumnName("source_server").IsRequired().HasMaxLength(100);
                 entity.Property(e => e.OperationId).HasColumnName("operation_id").IsRequired();
             });
+
+            // 配置复制失败日志表
+            modelBuilder.Entity<ReplicationFailureLog>(entity =>
+            {
+                entity.ToTable("replication_failure_logs");
+                entity.HasKey(e => e.Id);
+                entity.Property(e => e.TableName).HasColumnName("table_name").IsRequired().HasMaxLength(100);
+                entity.Property(e => e.OperationType).HasColumnName("operation_type").IsRequired();
+                entity.Property(e => e.RecordId).HasColumnName("record_id").IsRequired().HasMaxLength(200);
+                entity.Property(e => e.Data).IsRequired().HasMaxLength(100);
+                entity.Property(e => e.OriginalTimestamp).HasColumnName("original_timestamp").IsRequired();
+                entity.Property(e => e.FailedAt).HasColumnName("failed_at").IsRequired();
+                entity.Property(e => e.RetryCount).HasColumnName("retry_count").IsRequired();
+                entity.Property(e => e.ErrorMessage).HasColumnName("error_message").IsRequired().HasMaxLength(1000);
+                entity.Property(e => e.SourceServer).HasColumnName("source_server").IsRequired().HasMaxLength(100);
+                entity.Property(e => e.OriginalOperationId).HasColumnName("original_operation_id").IsRequired();
+                entity.Property(e => e.Direction).IsRequired();
+            });
+
+            // 配置同步进度表
+            modelBuilder.Entity<SyncProgress>(entity =>
+            {
+                entity.ToTable("sync_progress");
+                entity.HasKey(e => e.Id);
+                entity.Property(e => e.TableName).HasColumnName("table_name").IsRequired().HasMaxLength(100);
+                entity.Property(e => e.SourceServer).HasColumnName("source_server").IsRequired().HasMaxLength(100);
+                entity.Property(e => e.TargetServer).HasColumnName("target_server").IsRequired().HasMaxLength(100);
+                entity.Property(e => e.LastSyncedLogId).HasColumnName("last_synced_log_id").IsRequired();
+                entity.Property(e => e.LastSyncTime).HasColumnName("last_sync_time").IsRequired();
+                entity.Property(e => e.Direction).IsRequired();
+                entity.Property(e => e.IsActive).HasColumnName("is_active").IsRequired();
+                
+                // 创建唯一索引：表名+源服务器+目标服务器+方向
+                entity.HasIndex(e => new { e.TableName, e.SourceServer, e.TargetServer, e.Direction })
+                      .IsUnique()
+                      .HasDatabaseName("idx_sync_progress_unique");
+            });
         }
 
         // 初始化主库
@@ -84,6 +123,8 @@ namespace DatabaseReplication
         {
             CreateReplicationLogTable();
             CreateReplicationStatusTable();
+            CreateReplicationFailureLogTable();
+            CreateSyncProgressTable();
             CreateReplicationTriggers();
         }
 
@@ -122,6 +163,52 @@ namespace DatabaseReplication
                   `error_message` varchar(500) DEFAULT NULL,
                   PRIMARY KEY (`log_entry_id`),
                   FOREIGN KEY (`log_entry_id`) REFERENCES `replication_logs` (`id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
+
+            ExecuteSql(createTableSql);
+        }
+
+        // 创建复制失败日志表
+        private void CreateReplicationFailureLogTable()
+        {
+            string createTableSql = @"
+                CREATE TABLE IF NOT EXISTS `replication_failure_logs` (
+                  `id` int NOT NULL AUTO_INCREMENT,
+                  `table_name` varchar(100) NOT NULL,
+                  `operation_type` int(11) NOT NULL,
+                  `record_id` varchar(200) NOT NULL,
+                  `data` text,
+                  `error_message` text NOT NULL,
+                  `retry_count` int NOT NULL DEFAULT '0',
+                  `first_failure_time` datetime NOT NULL,
+                  `last_failure_time` datetime NOT NULL,
+                  `source_server` varchar(100) NOT NULL,
+                  `target_server` varchar(100) NOT NULL,
+                  `operation_id` char(36) NOT NULL,
+                  PRIMARY KEY (`id`),
+                  KEY `idx_table_operation` (`table_name`,`operation_type`),
+                  KEY `idx_failure_time` (`last_failure_time`),
+                  KEY `idx_operation_id` (`operation_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
+
+            ExecuteSql(createTableSql);
+        }
+
+        // 创建同步进度表
+        private void CreateSyncProgressTable()
+        {
+            string createTableSql = @"
+                CREATE TABLE IF NOT EXISTS `sync_progress` (
+                  `id` int NOT NULL AUTO_INCREMENT,
+                  `table_name` varchar(100) NOT NULL,
+                  `source_server` varchar(100) NOT NULL,
+                  `target_server` varchar(100) NOT NULL,
+                  `last_synced_log_id` int NOT NULL DEFAULT '0',
+                  `last_sync_time` datetime DEFAULT NULL,
+                  `created_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  `updated_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                  PRIMARY KEY (`id`),
+                  UNIQUE KEY `uk_sync_progress` (`table_name`,`source_server`,`target_server`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
 
             ExecuteSql(createTableSql);

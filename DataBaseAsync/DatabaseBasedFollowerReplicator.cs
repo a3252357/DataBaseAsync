@@ -452,6 +452,108 @@ namespace DatabaseReplication.Follower
             
             throw lastException;
         }
+        // 处理单个变更的重试逻辑（使用独立事务）
+        private async Task<bool> ProcessSingleChangeWithRetry(
+            FollowerDbContext followerContext,
+            TableConfig tableConfig,
+            ReplicationLogEntry change,
+            int maxRetries = 3)
+        {
+            Exception lastException = null;
+
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
+            {
+                // 为每个变更创建独立的DbContext和事务
+                using (var singleChangeContext = CreateFollowerDbContext())
+                {
+                    await using var transaction = await singleChangeContext.Database.BeginTransactionAsync();
+
+                    try
+                    {
+                        // 设置会话变量防止从库触发器递归
+                        await singleChangeContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 1");
+
+                        // 通过主键从主库获取完整实体
+                        var entity = await GetEntityFromLeader(tableConfig, change.Data);
+
+                        if (entity != null)
+                        {
+                            // 应用变更到从库
+                            await ApplyEntityChangeToFollower(singleChangeContext, tableConfig, change, entity);
+                        }
+                        else if (change.OperationType == ReplicationOperation.Delete)
+                        {
+                            // 对于删除操作，如果实体不存在，直接执行删除
+                            await DeleteEntityInFollower(singleChangeContext, tableConfig, change.Data);
+                        }
+
+                        // 保存变更
+                        await singleChangeContext.SaveChangesAsync();
+
+                        // 重置会话变量
+                        await singleChangeContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 0");
+
+                        // 提交事务
+                        await transaction.CommitAsync();
+
+                        _logger.Info($"表 {tableConfig.TableName} 变更 ID {change.Id} 处理成功");
+                        return true; // 成功处理
+                    }
+                    catch (Exception ex)
+                    {
+                        await transaction.RollbackAsync();
+                        lastException = ex;
+                        _logger.Warning($"表 {tableConfig.TableName} 变更 ID {change.Id} 第 {attempt} 次尝试失败: {ex.Message}");
+
+                        if (attempt < maxRetries)
+                        {
+                            // 指数退避策略
+                            int delay = 1000 * (int)Math.Pow(2, attempt - 1);
+                            _logger.Info($"等待 {delay}ms 后进行第 {attempt + 1} 次重试...");
+                            await Task.Delay(delay);
+                        }
+                    }
+                }
+            }
+
+            _logger.Error($"表 {tableConfig.TableName} 变更 ID {change.Id} 重试 {maxRetries} 次后仍然失败: {lastException?.Message}");
+            return false; // 处理失败
+        }
+
+        // 记录失败的变更到失败日志表
+        private async Task LogFailedChanges(List<ReplicationLogEntry> failedChanges, string tableName, string additionalError = null)
+        {
+            try
+            {
+                using (var leaderContext = CreateLeaderDbContext())
+                {
+                    foreach (var change in failedChanges)
+                    {
+                        var failureLog = new ReplicationFailureLog
+                        {
+                            Id = change.Id,
+                            TableName = tableName,
+                            OperationType = change.OperationType.ToString(),
+                            RecordId = change.Data,
+                            ErrorMessage = additionalError ?? "重试3次后仍然失败",
+                            FailureTime = DateTime.Now,
+                            RetryCount = 3,
+                            FollowerServerId = _followerServerId
+                        };
+
+                        leaderContext.ReplicationFailureLogs.Add(failureLog);
+                    }
+
+                    await leaderContext.SaveChangesAsync();
+                    _logger.Info($"已记录 {failedChanges.Count} 条失败变更到失败日志表");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"记录失败日志时出错: {ex.Message}");
+            }
+        }
+
         // 通用重试方法
         private async Task ExecuteWithRetry(Func<Task> operation, int maxRetries = 3, int delayMs = 1000, string operationName = "操作")
         {
@@ -676,6 +778,9 @@ namespace DatabaseReplication.Follower
             LeaderDbContext leaderContext,
             TableConfig tableConfig)
         {
+            // 获取当前表的同步进度
+            var lastSyncedId = await GetLastSyncedId(leaderContext, tableConfig.TableName);
+            
             string statusTableName = $"replication_status_{_followerServerId}";
 
             var sql = $@"
@@ -684,141 +789,193 @@ namespace DatabaseReplication.Follower
                 LEFT JOIN {statusTableName} s ON l.id = s.log_entry_id
                 WHERE l.table_name = @TableName
                   AND l.direction = 0
+                  AND l.id > @LastSyncedId
                   AND (s.is_synced IS NULL OR s.is_synced = 0)
-                ORDER BY l.timestamp ASC
+                ORDER BY l.id ASC
                 LIMIT @BatchSize";
 
             var parameters = new List<MySqlParameter>
             {
                 new MySqlParameter("@TableName", tableConfig.TableName),
+                new MySqlParameter("@LastSyncedId", lastSyncedId),
                 new MySqlParameter("@BatchSize", _batchSize)
             };
 
-            return await leaderContext.ReplicationLogs
+            var changes = await leaderContext.ReplicationLogs
                 .FromSqlRaw(sql, parameters.ToArray())
                 .ToListAsync();
+
+            // 如果获取到变更，更新同步进度
+            if (changes.Any())
+            {
+                var maxId = changes.Max(c => c.Id);
+                await UpdateSyncProgress(leaderContext, tableConfig.TableName, maxId);
+            }
+
+            return changes;
         }
 
-        // 应用变更到从库（带冲突检测）
+        // 获取最后同步的ID
+        private async Task<int> GetLastSyncedId(LeaderDbContext leaderContext, string tableName)
+        {
+            try
+            {
+                var syncProgress = await leaderContext.SyncProgresses
+                    .FirstOrDefaultAsync(sp => sp.TableName == tableName && sp.FollowerServerId == _followerServerId);
+                
+                return syncProgress?.LastSyncedId ?? 0;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warning($"获取同步进度失败，使用默认值0: {ex.Message}");
+                return 0;
+            }
+        }
+
+        // 更新同步进度
+        private async Task UpdateSyncProgress(LeaderDbContext leaderContext, string tableName, int lastSyncedId)
+        {
+            try
+            {
+                var syncProgress = await leaderContext.SyncProgresses
+                    .FirstOrDefaultAsync(sp => sp.TableName == tableName && sp.FollowerServerId == _followerServerId);
+
+                if (syncProgress == null)
+                {
+                    // 创建新的同步进度记录
+                    syncProgress = new SyncProgress
+                    {
+                        TableName = tableName,
+                        FollowerServerId = _followerServerId,
+                        LastSyncedId = lastSyncedId,
+                        LastSyncTime = DateTime.Now
+                    };
+                    leaderContext.SyncProgresses.Add(syncProgress);
+                }
+                else
+                {
+                    // 更新现有的同步进度记录
+                    syncProgress.LastSyncedId = lastSyncedId;
+                    syncProgress.LastSyncTime = DateTime.Now;
+                }
+
+                await leaderContext.SaveChangesAsync();
+                _logger.Info($"已更新表 {tableName} 的同步进度到 ID: {lastSyncedId}");
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"更新同步进度失败: {ex.Message}");
+            }
+        }
+,
+        // 应用变更到从库（带冲突检测和失败重试）
         private async Task ApplyChangesToFollower(
             FollowerDbContext followerContext,
             TableConfig tableConfig,
             List<ReplicationLogEntry> changes)
         {
-            await ExecuteWithRetry(async () =>
+            var failedChanges = new List<ReplicationLogEntry>();
+            var successfulChanges = new List<ReplicationLogEntry>();
+
+            try
             {
-                await using var transaction = await followerContext.Database.BeginTransactionAsync();
-
-                try
+                // 只有双向同步才需要检测冲突
+                if (tableConfig.ReplicationDirection == ReplicationDirection.Bidirectional)
                 {
-                    // 只有双向同步才需要检测冲突
-                    if (tableConfig.ReplicationDirection == ReplicationDirection.Bidirectional)
+                    var conflicts = await DetectConflicts(tableConfig, changes);
+
+                    if (conflicts.Any())
                     {
-                        var conflicts = await DetectConflicts(tableConfig, changes);
-                        
-                        if (conflicts.Any())
+                        _logger.Warning($"检测到 {conflicts.Count} 个冲突，开始解决冲突...");
+
+                        // 解决冲突
+                        var resolvedChanges = new List<ReplicationLogEntry>();
+                        foreach (var conflict in conflicts)
                         {
-                            _logger.Warning($"检测到 {conflicts.Count} 个冲突，开始解决冲突...");
-                            
-                            // 解决冲突
-                            var resolvedChanges = new List<ReplicationLogEntry>();
-                            foreach (var conflict in conflicts)
+                            var resolvedEntry = await ResolveConflict(conflict, tableConfig);
+                            if (resolvedEntry != null)
                             {
-                                var resolvedEntry = await ResolveConflict(conflict, tableConfig);
-                                if (resolvedEntry != null)
-                                {
-                                    resolvedChanges.Add(resolvedEntry);
-                                }
-                                
-                                // 记录冲突日志
-                                await LogConflict(conflict);
+                                resolvedChanges.Add(resolvedEntry);
                             }
-                            
-                            // 移除已解决的冲突变更，添加解决后的变更
-                            var conflictIds = conflicts.Select(c => c.SourceEntry.Id).ToHashSet();
-                            changes = changes.Where(c => !conflictIds.Contains(c.Id)).ToList();
-                            changes.AddRange(resolvedChanges);
+
+                            // 记录冲突日志
+                            await LogConflict(conflict);
                         }
+
+                        // 移除已解决的冲突变更，添加解决后的变更
+                        var conflictIds = conflicts.Select(c => c.SourceEntry.Id).ToHashSet();
+                        changes = changes.Where(c => !conflictIds.Contains(c.Id)).ToList();
+                        changes.AddRange(resolvedChanges);
                     }
-
-                    // 批量操作开始时设置会话变量防止从库触发器递归
-                    await followerContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 1");
-
-                    foreach (var change in changes)
-                    {
-                        // 通过主键从主库获取完整实体
-                        var entity = await GetEntityFromLeader(tableConfig, change.Data);
-
-                        if (entity != null)
-                        {
-                            // 应用变更到从库
-                            await ApplyEntityChangeToFollower(followerContext, tableConfig, change, entity);
-                        }
-                        else if (change.OperationType == ReplicationOperation.Delete)
-                        {
-                            // 对于删除操作，如果实体不存在，直接执行删除
-                            await DeleteEntityInFollower(followerContext, tableConfig, change.Data);
-                        }
-                    }
-
-                    await followerContext.SaveChangesAsync();
-                    
-                    // 批量操作完成后重置会话变量
-                    await followerContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 0");
-                    await transaction.CommitAsync();
                 }
-                catch (Exception ex)
+
+                // 对变更列表进行去重处理，确保对同一个主键的多次操作只处理最后一次
+                changes = DeduplicateChanges(changes, tableConfig.TableName);
+
+                // 逐个处理变更，每个变更使用独立事务
+                foreach (var change in changes)
                 {
-                    await transaction.RollbackAsync();
-                    _logger.Error($"应用变更到从库时出错: {ex.Message}");
-                    throw;
+                    bool success = await ProcessSingleChangeWithRetry(followerContext, tableConfig, change);
+                    
+                    if (success)
+                    {
+                        successfulChanges.Add(change);
+                    }
+                    else
+                    {
+                        failedChanges.Add(change);
+                    }
                 }
-            }, 3, 1000, $"应用变更到从库 - 表 {tableConfig.TableName}");
+
+                // 记录失败的变更到失败日志表
+                if (failedChanges.Any())
+                {
+                    await LogFailedChanges(failedChanges, tableConfig.TableName);
+                }
+
+                _logger.Info($"表 {tableConfig.TableName} 变更处理完成: 成功 {successfulChanges.Count} 条，失败 {failedChanges.Count} 条");
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"应用变更到从库时出错: {ex.Message}");
+                
+                // 如果整个过程失败，将所有变更记录为失败
+                await LogFailedChanges(changes, tableConfig.TableName, ex.Message);
+                throw;
+            }
         }
 
-        // 通用的根据主键查找实体的方法（使用 IQueryable）
-        private async Task<object> FindByPrimaryKeyAsync(dynamic dbSet, TableConfig tableConfig, object primaryKeyValue)
-        {
-            // 使用 IQueryable 方式查询
-            IQueryable queryable = dbSet;
-            var parameter = Expression.Parameter(tableConfig.EntityType, "x");
-            var property = Expression.Property(parameter, tableConfig.PrimaryKey);
-            var constant = Expression.Constant(primaryKeyValue);
-            var equal = Expression.Equal(property, constant);
-            var lambda = Expression.Lambda(equal, parameter);
-            
-            var whereMethod = typeof(Queryable).GetMethods()
-                .Where(m => m.Name == "Where" && m.GetParameters().Length == 2)
-                .First()
-                .MakeGenericMethod(tableConfig.EntityType);
-            
-            var filteredQuery = whereMethod.Invoke(null, new object[] { queryable, lambda });
-            
-            var firstOrDefaultMethod = typeof(Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions)
-                .GetMethods()
-                .Where(m => m.Name == "FirstOrDefaultAsync" && m.GetParameters().Length == 2)
-                .First()
-                .MakeGenericMethod(tableConfig.EntityType);
-            var data= await (dynamic)firstOrDefaultMethod.Invoke(null, new object[] { filteredQuery, CancellationToken.None });
-            return data;
-        }
+
 
         // 从主库获取实体
         private async Task<object> GetEntityFromLeader(TableConfig tableConfig, string primaryKeyValue)
         {
             using (var leaderContext = CreateLeaderDbContext())
             {
-                var setMethod = typeof(DbContext).GetMethod("Set", Type.EmptyTypes);
-                var genericSetMethod = setMethod.MakeGenericMethod(tableConfig.EntityType);
-                dynamic dbSet = genericSetMethod.Invoke(leaderContext, null);
                 var primaryKeyProperty = tableConfig.EntityType.GetProperty(tableConfig.PrimaryKey);
 
                 if (primaryKeyProperty == null)
                     throw new InvalidOperationException($"找不到实体 {tableConfig.EntityType.Name} 的主键属性: {tableConfig.PrimaryKey}");
 
                 var convertedValue = Convert.ChangeType(primaryKeyValue, primaryKeyProperty.PropertyType);
-                return await FindByPrimaryKeyAsync(dbSet, tableConfig, convertedValue);
+                
+                // 使用EF Core的FindAsync方法直接查找实体
+                return await leaderContext.FindAsync(tableConfig.EntityType, convertedValue);
             }
+        }
+
+        // 从主库获取实体（使用现有的DbContext）
+        private async Task<object> GetEntityFromLeaderWithContext(LeaderDbContext leaderContext, TableConfig tableConfig, string primaryKeyValue)
+        {
+            var primaryKeyProperty = tableConfig.EntityType.GetProperty(tableConfig.PrimaryKey);
+
+            if (primaryKeyProperty == null)
+                throw new InvalidOperationException($"找不到实体 {tableConfig.EntityType.Name} 的主键属性: {tableConfig.PrimaryKey}");
+
+            var convertedValue = Convert.ChangeType(primaryKeyValue, primaryKeyProperty.PropertyType);
+            
+            // 使用EF Core的FindAsync方法直接查找实体
+            return await leaderContext.FindAsync(tableConfig.EntityType, convertedValue);
         }
 
         // 应用实体变更到从库
@@ -840,32 +997,22 @@ namespace DatabaseReplication.Follower
             switch (log.OperationType)
             {
                 case ReplicationOperation.Insert:
-                    // 检查是否已经被跟踪
+                    // 先检查记录是否已存在
+                    var existingEntityI = await followerContext.FindAsync(tableConfig.EntityType, primaryKeyValue);
+                    if (existingEntityI != null)
+                    {
+                        // 记录已存在，跳过处理
+                        break;
+                    }
+
                     var trackedInsertEntity = followerContext.Entry(typedEntity).Entity;
-                    if (followerContext.Entry(trackedInsertEntity).State == EntityState.Detached)
-                    {
-                        dbSet.Add(typedEntity);
-                    }
-                    else
-                    {
-                        // 实体已被跟踪，检查是否需要更新
-                        var existingTracked = await FindByPrimaryKeyAsync(dbSet, tableConfig, primaryKeyValue);
-                        if (existingTracked != null)
-                        {
-                            // 更新已跟踪的实体
-                            followerContext.Entry(existingTracked).CurrentValues.SetValues(typedEntity);
-                        }
-                        else
-                        {
-                            dbSet.Add(typedEntity);
-                        }
-                    }
+                    dbSet.Add(typedEntity);
                     _logger.Info($"在从库插入表 {tableConfig.TableName} 记录 {log.Data}");
                     break;
 
                 case ReplicationOperation.Update:
                     // 检查目标记录是否存在
-                    var existingEntity = await FindByPrimaryKeyAsync(dbSet, tableConfig, primaryKeyValue);
+                    var existingEntity = await followerContext.FindAsync(tableConfig.EntityType, primaryKeyValue);
                     
                     if (existingEntity != null)
                     {
@@ -896,19 +1043,11 @@ namespace DatabaseReplication.Follower
 
                 case ReplicationOperation.Delete:
                     // 对于删除操作，先查找已跟踪的实体
-                    var entityToDelete = await FindByPrimaryKeyAsync(dbSet, tableConfig, primaryKeyValue);
+                    var entityToDelete = await followerContext.FindAsync(tableConfig.EntityType, primaryKeyValue);
                     if (entityToDelete != null)
                     {
                         dbSet.Remove(entityToDelete);
                         _logger.Info($"在从库删除表 {tableConfig.TableName} 记录 {log.Data}");
-                    }
-                    else
-                    {
-                        // 如果实体不存在，创建一个只包含主键的实体进行删除
-                        var deleteEntity = Activator.CreateInstance(tableConfig.EntityType);
-                        primaryKeyProperty.SetValue(deleteEntity, primaryKeyValue);
-                        followerContext.Entry(deleteEntity).State = EntityState.Deleted;
-                        _logger.Info($"在从库删除表 {tableConfig.TableName} 记录 {log.Data}（实体不存在，创建删除标记）");
                     }
                     break;
             }
@@ -929,13 +1068,13 @@ namespace DatabaseReplication.Follower
                 throw new InvalidOperationException($"找不到实体 {tableConfig.EntityType.Name} 的主键属性: {tableConfig.PrimaryKey}");
 
             var convertedValue = Convert.ChangeType(primaryKeyValue, primaryKeyProperty.PropertyType);
-
-            // 创建一个只包含主键的实体实例
-            var entity = Activator.CreateInstance(tableConfig.EntityType);
-            primaryKeyProperty.SetValue(entity, convertedValue);
-
-            // 标记为删除状态
-            followerContext.Entry(entity).State = EntityState.Deleted;
+            // 对于删除操作，先查找已跟踪的实体
+            var entityToDelete = await followerContext.FindAsync(tableConfig.EntityType, primaryKeyValue);
+            if (entityToDelete != null)
+            {
+                dbSet.Remove(entityToDelete);
+                _logger.Info($"在从库删除表 {tableConfig.TableName} 记录 {primaryKeyValue}");
+            }
         }
 
         // 安全地转换实体类型
@@ -1072,12 +1211,20 @@ namespace DatabaseReplication.Follower
                             using (var command = new MySqlCommand(updateSql, connection, transaction))
                             {
                                 command.Parameters.AddWithValue("@LogEntryId", change.Id);
-                                command.Parameters.AddWithValue("@SyncTime", DateTime.UtcNow);
+                                command.Parameters.AddWithValue("@SyncTime", DateTime.Now);
                                 await command.ExecuteNonQueryAsync();
                             }
                         }
 
                         await transaction.CommitAsync();
+                        
+                        // 更新同步进度到最大的变更ID
+                        if (changes.Any())
+                        {
+                            var maxId = changes.Max(c => c.Id);
+                            var tableName = changes.First().TableName;
+                            await UpdateSyncProgress(leaderContext, tableName, maxId);
+                        }
                     }
                     catch (Exception ex)
                     {
@@ -1207,6 +1354,9 @@ namespace DatabaseReplication.Follower
 
                 try
                 {
+                    // 对变更列表进行去重处理，确保对同一个主键的多次操作只处理最后一次
+                    changes = DeduplicateChanges(changes, tableConfig.TableName);
+                    
                     // 批量操作开始时设置会话变量防止主库触发器递归
                     await leaderContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 1");
 
@@ -1220,11 +1370,11 @@ namespace DatabaseReplication.Follower
                             // 应用变更到主库
                             await ApplyEntityChangeToLeader(leaderContext, tableConfig, change, entity);
                         }
-                        else if (change.OperationType == ReplicationOperation.Delete)
-                        {
-                            // 对于删除操作，如果实体不存在，直接执行删除
-                            await DeleteEntityInLeader(leaderContext, tableConfig, change.Data);
-                        }
+                        //else if (change.OperationType == ReplicationOperation.Delete)
+                        //{
+                        //    // 对于删除操作，如果实体不存在，直接执行删除
+                        //    await DeleteEntityInLeader(leaderContext, tableConfig, change.Data);
+                        //}
                     }
 
                     await leaderContext.SaveChangesAsync();
@@ -1256,7 +1406,7 @@ namespace DatabaseReplication.Follower
                     throw new InvalidOperationException($"找不到实体 {tableConfig.EntityType.Name} 的主键属性: {tableConfig.PrimaryKey}");
 
                 var convertedValue = Convert.ChangeType(primaryKeyValue, primaryKeyProperty.PropertyType);
-                return await FindByPrimaryKeyAsync(dbSet, tableConfig, convertedValue);
+                return await followerContext.FindAsync(tableConfig.EntityType, convertedValue);
             }
         }
 
@@ -1280,35 +1430,32 @@ namespace DatabaseReplication.Follower
             {
                 case ReplicationOperation.Insert:
 
-                    // 检查是否已经被跟踪
+                    // 先检查记录是否已存在
+                    var existingEntityI = await leaderContext.FindAsync(tableConfig.EntityType, primaryKeyValue);
+                    if (existingEntityI != null)
+                    {
+                        // 记录已存在，跳过处理
+                        break;
+                    }
+
                     var trackedInsertEntity = leaderContext.Entry(typedEntity).Entity;
-                    if (leaderContext.Entry(trackedInsertEntity).State == EntityState.Detached)
-                    {
-                        dbSet.Add(typedEntity);
-                    }
-                    else
-                    {
-                        // 实体已被跟踪，检查是否需要更新
-                        var existingTracked = await FindByPrimaryKeyAsync(dbSet, tableConfig, primaryKeyValue);
-                        if (existingTracked != null)
-                        {
-                            // 更新已跟踪的实体
-                            leaderContext.Entry(existingTracked).CurrentValues.SetValues(typedEntity);
-                        }
-                        else
-                        {
-                            dbSet.Add(typedEntity);
-                        }
-                    }
-                    _logger.Info($"在主库插入表 {tableConfig.TableName} 记录 {log.Data}（来自从库 {_followerServerId}）");
+                    dbSet.Add(typedEntity);
+                    _logger.Info($"在从库插入表 {tableConfig.TableName} 记录 {log.Data}");
                     break;
 
                 case ReplicationOperation.Update:
                     // 检查目标记录是否存在
-                    var existingEntity = await FindByPrimaryKeyAsync(dbSet, tableConfig, primaryKeyValue);
+                    var existingEntity = await leaderContext.FindAsync(tableConfig.EntityType, primaryKeyValue);
                     
                     if (existingEntity != null)
                     {
+                        // 检查主库记录是否在从库变更之后有新的变更
+                        if (CheckLeaderReplicationLogForConflict(existingEntity, log, tableConfig))
+                        {
+                            _logger.Warning($"检测到冲突：主库表 {tableConfig.TableName} 记录在从库变更之后有新的变更，跳过覆盖。主键: {primaryKeyValue}");
+                            break;
+                        }
+
                         // 记录存在，更新已跟踪的实体
                         leaderContext.Entry(existingEntity).CurrentValues.SetValues(typedEntity);
 
@@ -1335,21 +1482,21 @@ namespace DatabaseReplication.Follower
                     break;
 
                 case ReplicationOperation.Delete:
-                    // 对于删除操作，先查找已跟踪的实体
-                    var entityToDelete = await FindByPrimaryKeyAsync(dbSet, tableConfig, primaryKeyValue);
-                    if (entityToDelete != null)
-                    {
-                        dbSet.Remove(entityToDelete);
-                        _logger.Info($"在主库删除表 {tableConfig.TableName} 记录 {log.Data}（来自从库 {_followerServerId}）");
-                    }
-                    else
-                    {
-                        // 如果实体不存在，创建一个只包含主键的实体进行删除
-                        var deleteEntity = Activator.CreateInstance(tableConfig.EntityType);
-                        primaryKeyProperty.SetValue(deleteEntity, primaryKeyValue);
-                        leaderContext.Entry(deleteEntity).State = EntityState.Deleted;
-                        _logger.Info($"在主库删除表 {tableConfig.TableName} 记录 {log.Data}（实体不存在，创建删除标记）（来自从库 {_followerServerId}）");
-                    }
+                    //// 对于删除操作，先查找已跟踪的实体
+                    //var entityToDelete = await leaderContext.FindAsync(tableConfig.EntityType, primaryKeyValue);
+                    //if (entityToDelete != null)
+                    //{
+                    //    dbSet.Remove(entityToDelete);
+                    //    _logger.Info($"在主库删除表 {tableConfig.TableName} 记录 {log.Data}（来自从库 {_followerServerId}）");
+                    //}
+                    //else
+                    //{
+                    //    // 如果实体不存在，创建一个只包含主键的实体进行删除
+                    //    var deleteEntity = Activator.CreateInstance(tableConfig.EntityType);
+                    //    primaryKeyProperty.SetValue(deleteEntity, primaryKeyValue);
+                    //    leaderContext.Entry(deleteEntity).State = EntityState.Deleted;
+                    //    _logger.Info($"在主库删除表 {tableConfig.TableName} 记录 {log.Data}（实体不存在，创建删除标记）（来自从库 {_followerServerId}）");
+                    //}
                     break;
             }
         }
@@ -1406,7 +1553,7 @@ namespace DatabaseReplication.Follower
                             using (var command = new MySqlCommand(updateSql, connection, transaction))
                             {
                                 command.Parameters.AddWithValue("@LogEntryId", change.Id);
-                                command.Parameters.AddWithValue("@SyncTime", DateTime.UtcNow);
+                                command.Parameters.AddWithValue("@SyncTime", DateTime.Now);
                                 await command.ExecuteNonQueryAsync();
                             }
                         }
@@ -1609,9 +1756,9 @@ namespace DatabaseReplication.Follower
             
             conflicts.AddRange(conflictingFollowerChanges);
             
-            // 检查主库是否有更新的变更
-            var newerLeaderChanges = await GetNewerChangesFromLeader(leaderContext, tableConfig, change);
-            conflicts.AddRange(newerLeaderChanges);
+            //// 检查主库是否有更新的变更
+            //var newerLeaderChanges = await GetNewerChangesFromLeader(leaderContext, tableConfig, change);
+            //conflicts.AddRange(newerLeaderChanges);
             
             return conflicts;
         }
@@ -2009,7 +2156,7 @@ namespace DatabaseReplication.Follower
                 command.Parameters.AddWithValue("@ResolutionStrategy", conflict.ResolutionReason ?? "");
                 command.Parameters.AddWithValue("@Details", System.Text.Json.JsonSerializer.Serialize(conflict));
                 command.Parameters.AddWithValue("@ResolvedBy", $"System_{_followerServerId}");
-                command.Parameters.AddWithValue("@ResolvedAt", DateTime.UtcNow);
+                command.Parameters.AddWithValue("@ResolvedAt", DateTime.Now);
                 
                 await command.ExecuteNonQueryAsync();
             }
@@ -2094,7 +2241,7 @@ namespace DatabaseReplication.Follower
                     {
                         TableName = tableConfig.TableName,
                         StartTime = lastSyncTime,
-                        EndTime = DateTime.UtcNow,
+                        EndTime = DateTime.Now,
                         MissedOperations = missedCount,
                         Reason = "网络中断或同步延迟"
                     };
@@ -2223,6 +2370,157 @@ namespace DatabaseReplication.Follower
         }
 
         #endregion
+
+        // 检查主库记录是否在从库变更之后有新的变更
+        private bool HasConflictWithLeaderChanges(object leaderEntity, ReplicationLogEntry followerLog, TableConfig tableConfig)
+        {
+            try
+            {
+                // 查找实体中的时间戳字段（常见的字段名）
+                var timestampProperties = new[] { "ModifyDate" };
+                
+                foreach (var propName in timestampProperties)
+                {
+                    var timestampProperty = tableConfig.EntityType.GetProperty(propName);
+                    if (timestampProperty != null && 
+                        (timestampProperty.PropertyType == typeof(DateTime) || 
+                         timestampProperty.PropertyType == typeof(DateTime?)))
+                    {
+                        var leaderTimestamp = timestampProperty.GetValue(leaderEntity) as DateTime?;
+                        
+                        if (leaderTimestamp.HasValue && leaderTimestamp.Value > followerLog.Timestamp)
+                        {
+                            _logger.Info($"检测到冲突：主库记录时间戳 {leaderTimestamp.Value:yyyy-MM-dd HH:mm:ss.fff} 晚于从库变更时间 {followerLog.Timestamp:yyyy-MM-dd HH:mm:ss.fff}");
+                            return true;
+                        }
+                        
+                        // 找到时间戳字段就返回，不继续查找其他字段
+                        return false;
+                    }
+                }
+                
+                // 如果没有找到时间戳字段，检查主库的复制日志
+                return CheckLeaderReplicationLogForConflict(leaderEntity, followerLog, tableConfig);
+            }
+            catch (Exception ex)
+            {
+                _logger.Warning($"检查冲突时出错: {ex.Message}，默认允许更新");
+                return false;
+            }
+        }
+
+        // 通过主库复制日志检查冲突
+        private bool CheckLeaderReplicationLogForConflict(object leaderEntity, ReplicationLogEntry followerLog, TableConfig tableConfig)
+        {
+            try
+            {
+                var primaryKeyProperty = tableConfig.EntityType.GetProperty(tableConfig.PrimaryKey);
+                var primaryKeyValue = primaryKeyProperty.GetValue(leaderEntity)?.ToString();
+                
+                using (var leaderContext = CreateLeaderDbContext())
+                {
+                    // 查找主库中该记录在从库变更时间之后的最新变更
+                    var latestLeaderLog = leaderContext.ReplicationLogs
+                        .Where(l => l.TableName == tableConfig.TableName && 
+                               l.RecordId == primaryKeyValue &&
+                               l.Timestamp > followerLog.Timestamp &&
+                               l.Direction == ReplicationDirection.LeaderToFollower)
+                        .OrderByDescending(l => l.Timestamp)
+                        .FirstOrDefault();
+                        
+                    if (latestLeaderLog != null)
+                    {
+                        _logger.Info($"检测到冲突：主库在 {latestLeaderLog.Timestamp:yyyy-MM-dd HH:mm:ss.fff} 有新变更，晚于从库变更时间 {followerLog.Timestamp:yyyy-MM-dd HH:mm:ss.fff}");
+                        return true;
+                    }
+                }
+                
+                return false;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warning($"通过复制日志检查冲突时出错: {ex.Message}，默认允许更新");
+                return false;
+            }
+        }
+
+        // 复杂去重处理，考虑操作类型优先级和时间顺序
+        private List<ReplicationLogEntry> DeduplicateChanges(List<ReplicationLogEntry> changes, string tableName)
+        {
+            var originalCount = changes.Count;
+            
+            // 按主键分组进行去重处理
+            var deduplicatedChanges = changes
+                .GroupBy(c => c.Data) // 按主键分组
+                .Select(group => {
+                    var groupChanges = group.OrderBy(c => c.Timestamp).ToList();
+                    
+                    // 如果组内只有一个变更，直接返回
+                    if (groupChanges.Count == 1)
+                        return groupChanges.First();
+                    
+                    // 按时间顺序分析操作序列，处理删除后插入的场景
+                    var deleteOperations = groupChanges.Where(c => c.OperationType == ReplicationOperation.Delete).ToList();
+                    var insertOperations = groupChanges.Where(c => c.OperationType == ReplicationOperation.Insert).ToList();
+                    var updateOperations = groupChanges.Where(c => c.OperationType == ReplicationOperation.Update).ToList();
+                    
+                    // 如果有删除操作，需要检查删除后是否有插入
+                    if (deleteOperations.Any())
+                    {
+                        var latestDelete = deleteOperations.OrderByDescending(c => c.Timestamp).First();
+                        
+                        // 检查删除后是否有插入操作
+                        var insertsAfterDelete = insertOperations.Where(i => i.Timestamp > latestDelete.Timestamp).ToList();
+                        if (insertsAfterDelete.Any())
+                        {
+                            // 删除后有插入，选择最新的插入操作
+                            var latestInsertAfterDelete = insertsAfterDelete.OrderByDescending(i => i.Timestamp).First();
+                            
+                            // 还需要检查插入后是否有更新
+                            var updatesAfterInsert = updateOperations.Where(u => u.Timestamp > latestInsertAfterDelete.Timestamp).ToList();
+                            if (updatesAfterInsert.Any())
+                            {
+                                return updatesAfterInsert.OrderByDescending(u => u.Timestamp).First();
+                            }
+                            
+                            return latestInsertAfterDelete;
+                        }
+                        
+                        // 删除后没有插入，返回最新的删除操作
+                        return latestDelete;
+                    }
+                    
+                    // 没有删除操作，处理插入和更新操作
+                    if (insertOperations.Any() && updateOperations.Any())
+                    {
+                        // 比较插入和更新操作的时间戳，选择最新的
+                        var latestInsert = insertOperations.OrderByDescending(c => c.Timestamp).First();
+                        var latestUpdate = updateOperations.OrderByDescending(c => c.Timestamp).First();
+                        
+                        return latestInsert.Timestamp > latestUpdate.Timestamp ? latestInsert : latestUpdate;
+                    }
+                    
+                    // 只有插入操作或只有更新操作，选择最新的
+                    return groupChanges.OrderByDescending(c => c.Timestamp).First();
+                })
+                .OrderBy(c => c.Timestamp) // 按时间戳重新排序
+                .ToList();
+            
+            if (originalCount != deduplicatedChanges.Count)
+            {
+                _logger.Info($"表 {tableName} 去重处理：原始变更数量 {originalCount}，去重后数量 {deduplicatedChanges.Count}");
+                
+                // 记录详细的去重信息
+                var groupedOriginal = changes.GroupBy(c => c.Data).Where(g => g.Count() > 1);
+                foreach (var group in groupedOriginal)
+                {
+                    var operations = group.Select(c => $"{c.OperationType}({c.Timestamp:HH:mm:ss.fff})");
+                    _logger.Debug($"主键 {group.Key} 的操作去重：{string.Join(", ", operations)} -> 保留最终操作");
+                }
+            }
+            
+            return deduplicatedChanges;
+        }
 
         // 实现IDisposable接口
         public void Dispose()
