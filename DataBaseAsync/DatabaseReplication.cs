@@ -155,28 +155,23 @@ namespace DatabaseReplication
     {
         public int Id { get; set; }
         public string TableName { get; set; }
-        public ReplicationOperation OperationType { get; set; }
+        public string OperationType { get; set; }  // 改为string类型，与代码使用一致
         public string RecordId { get; set; }
-        public string Data { get; set; }
-        public DateTime OriginalTimestamp { get; set; }
-        public DateTime FailedAt { get; set; }
-        public int RetryCount { get; set; }
+        public string Data { get; set; }  // 保留此字段
         public string ErrorMessage { get; set; }
-        public string SourceServer { get; set; }
-        public Guid OriginalOperationId { get; set; }
-        public ReplicationDirection Direction { get; set; }
+        public DateTime FailureTime { get; set; }  // 改为FailureTime，与代码使用一致
+        public int RetryCount { get; set; }
+        public string FollowerServerId { get; set; }  // 改为FollowerServerId，与代码使用一致
+        // 移除不使用的字段：OriginalTimestamp, FailedAt, SourceServer, OriginalOperationId, Direction
     }
 
-    // 同步进度记录
     public class SyncProgress
     {
         public int Id { get; set; }
         public string TableName { get; set; }
-        public string SourceServer { get; set; }
-        public string TargetServer { get; set; }
-        public int LastSyncedLogId { get; set; }
+        public string FollowerServerId { get; set; }  // 与代码使用一致
+        public int LastSyncedId { get; set; }         // 与代码使用一致
         public DateTime LastSyncTime { get; set; }
-        public ReplicationDirection Direction { get; set; }
-        public bool IsActive { get; set; } = true;
+        // 移除用户提供但代码中未使用的字段：SourceServer, TargetServer, Direction, IsActive
     }
 }

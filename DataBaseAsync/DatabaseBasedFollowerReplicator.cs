@@ -452,7 +452,7 @@ namespace DatabaseReplication.Follower
             
             throw lastException;
         }
-        // 处理单个变更的重试逻辑（使用独立事务）
+        // 处理单个变更的重试逻辑（事务外移）
         private async Task<bool> ProcessSingleChangeWithRetry(
             FollowerDbContext followerContext,
             TableConfig tableConfig,
@@ -463,59 +463,45 @@ namespace DatabaseReplication.Follower
 
             for (int attempt = 1; attempt <= maxRetries; attempt++)
             {
-                // 为每个变更创建独立的DbContext和事务
-                using (var singleChangeContext = CreateFollowerDbContext())
+                try
                 {
-                    await using var transaction = await singleChangeContext.Database.BeginTransactionAsync();
+                    // 通过主键从主库获取完整实体
+                    var entity = await GetEntityFromLeader(tableConfig, change.Data);
 
-                    try
+                    if (entity != null)
                     {
-                        // 设置会话变量防止从库触发器递归
-                        await singleChangeContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 1");
-
-                        // 通过主键从主库获取完整实体
-                        var entity = await GetEntityFromLeader(tableConfig, change.Data);
-
-                        if (entity != null)
-                        {
-                            // 应用变更到从库
-                            await ApplyEntityChangeToFollower(singleChangeContext, tableConfig, change, entity);
-                        }
-                        else if (change.OperationType == ReplicationOperation.Delete)
-                        {
-                            // 对于删除操作，如果实体不存在，直接执行删除
-                            await DeleteEntityInFollower(singleChangeContext, tableConfig, change.Data);
-                        }
-
-                        // 保存变更
-                        await singleChangeContext.SaveChangesAsync();
-
-                        // 重置会话变量
-                        await singleChangeContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 0");
-
-                        // 提交事务
-                        await transaction.CommitAsync();
-
-                        _logger.Info($"表 {tableConfig.TableName} 变更 ID {change.Id} 处理成功");
-                        return true; // 成功处理
+                        // 应用变更到从库
+                        await ApplyEntityChangeToFollower(followerContext, tableConfig, change, entity);
                     }
-                    catch (Exception ex)
+                    else if (change.OperationType == ReplicationOperation.Delete)
                     {
-                        await transaction.RollbackAsync();
-                        lastException = ex;
-                        _logger.Warning($"表 {tableConfig.TableName} 变更 ID {change.Id} 第 {attempt} 次尝试失败: {ex.Message}");
+                        // 对于删除操作，如果实体不存在，直接执行删除
+                        await DeleteEntityInFollower(followerContext, tableConfig, change.Data);
+                    }
 
-                        if (attempt < maxRetries)
-                        {
-                            // 指数退避策略
-                            int delay = 1000 * (int)Math.Pow(2, attempt - 1);
-                            _logger.Info($"等待 {delay}ms 后进行第 {attempt + 1} 次重试...");
-                            await Task.Delay(delay);
-                        }
+                    // 每条数据调用一次SaveChanges
+                    await followerContext.SaveChangesAsync();
+
+                    _logger.Info($"表 {tableConfig.TableName} 变更 ID {change.Id} 处理成功");
+                    return true; // 成功处理
+                }
+                catch (Exception ex)
+                {
+                    lastException = ex;
+                    _logger.Warning($"表 {tableConfig.TableName} 变更 ID {change.Id} 第 {attempt} 次尝试失败: {ex.Message}");
+
+                    if (attempt < maxRetries)
+                    {
+                        // 指数退避策略
+                        int delay = 1000 * (int)Math.Pow(2, attempt - 1);
+                        _logger.Info($"等待 {delay}ms 后进行第 {attempt + 1} 次重试...");
+                        await Task.Delay(delay);
                     }
                 }
             }
 
+            // 重试3次后仍然失败，记录失败数据
+            await LogFailedChange(change, tableConfig.TableName, lastException?.Message);
             _logger.Error($"表 {tableConfig.TableName} 变更 ID {change.Id} 重试 {maxRetries} 次后仍然失败: {lastException?.Message}");
             return false; // 处理失败
         }
@@ -546,6 +532,36 @@ namespace DatabaseReplication.Follower
 
                     await leaderContext.SaveChangesAsync();
                     _logger.Info($"已记录 {failedChanges.Count} 条失败变更到失败日志表");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"记录失败日志时出错: {ex.Message}");
+            }
+        }
+
+        // 记录单个失败的变更到失败日志表
+        private async Task LogFailedChange(ReplicationLogEntry change, string tableName, string errorMessage = null)
+        {
+            try
+            {
+                using (var leaderContext = CreateLeaderDbContext())
+                {
+                    var failureLog = new ReplicationFailureLog
+                    {
+                        Id = change.Id,
+                        TableName = tableName,
+                        OperationType = change.OperationType.ToString(),
+                        RecordId = change.Data,
+                        ErrorMessage = errorMessage ?? "重试3次后仍然失败",
+                        FailureTime = DateTime.Now,
+                        RetryCount = 3,
+                        FollowerServerId = _followerServerId
+                    };
+
+                    leaderContext.ReplicationFailureLogs.Add(failureLog);
+                    await leaderContext.SaveChangesAsync();
+                    _logger.Info($"已记录失败变更到失败日志表: 表 {tableName} 变更 ID {change.Id}");
                 }
             }
             catch (Exception ex)
@@ -805,13 +821,6 @@ namespace DatabaseReplication.Follower
                 .FromSqlRaw(sql, parameters.ToArray())
                 .ToListAsync();
 
-            // 如果获取到变更，更新同步进度
-            if (changes.Any())
-            {
-                var maxId = changes.Max(c => c.Id);
-                await UpdateSyncProgress(leaderContext, tableConfig.TableName, maxId);
-            }
-
             return changes;
         }
 
@@ -832,7 +841,7 @@ namespace DatabaseReplication.Follower
             }
         }
 
-        // 更新同步进度
+        // 更新同步进度（主库到从库）
         private async Task UpdateSyncProgress(LeaderDbContext leaderContext, string tableName, int lastSyncedId)
         {
             try
@@ -860,14 +869,67 @@ namespace DatabaseReplication.Follower
                 }
 
                 await leaderContext.SaveChangesAsync();
-                _logger.Info($"已更新表 {tableName} 的同步进度到 ID: {lastSyncedId}");
+                _logger.Info($"已更新表 {tableName} 的主库到从库同步进度到 ID: {lastSyncedId}");
             }
             catch (Exception ex)
             {
-                _logger.Error($"更新同步进度失败: {ex.Message}");
+                _logger.Error($"更新主库到从库同步进度失败: {ex.Message}");
             }
         }
-,
+
+        // 获取从库到主库的同步进度
+        private async Task<int> GetLastSyncedIdToLeader(FollowerDbContext followerContext, string tableName)
+        {
+            try
+            {
+                var syncProgress = await followerContext.SyncProgresses
+                    .FirstOrDefaultAsync(sp => sp.TableName == tableName && sp.FollowerServerId == _followerServerId);
+                
+                return syncProgress?.LastSyncedId ?? 0;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warning($"获取从库到主库同步进度失败，使用默认值0: {ex.Message}");
+                return 0;
+            }
+        }
+
+        // 更新从库到主库的同步进度
+        private async Task UpdateSyncProgressToLeader(FollowerDbContext followerContext, string tableName, int lastSyncedId)
+        {
+            try
+            {
+                var syncProgress = await followerContext.SyncProgresses
+                    .FirstOrDefaultAsync(sp => sp.TableName == tableName && sp.FollowerServerId == _followerServerId);
+
+                if (syncProgress == null)
+                {
+                    // 创建新的同步进度记录
+                    syncProgress = new SyncProgress
+                    {
+                        TableName = tableName,
+                        FollowerServerId = _followerServerId,
+                        LastSyncedId = lastSyncedId,
+                        LastSyncTime = DateTime.Now
+                    };
+                    followerContext.SyncProgresses.Add(syncProgress);
+                }
+                else
+                {
+                    // 更新现有的同步进度记录
+                    syncProgress.LastSyncedId = lastSyncedId;
+                    syncProgress.LastSyncTime = DateTime.Now;
+                }
+
+                await followerContext.SaveChangesAsync();
+                _logger.Info($"已更新表 {tableName} 的从库到主库同步进度到 ID: {lastSyncedId}");
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"更新从库到主库同步进度失败: {ex.Message}");
+            }
+        }
+
         // 应用变更到从库（带冲突检测和失败重试）
         private async Task ApplyChangesToFollower(
             FollowerDbContext followerContext,
@@ -912,28 +974,44 @@ namespace DatabaseReplication.Follower
                 // 对变更列表进行去重处理，确保对同一个主键的多次操作只处理最后一次
                 changes = DeduplicateChanges(changes, tableConfig.TableName);
 
-                // 逐个处理变更，每个变更使用独立事务
-                foreach (var change in changes)
+                // 在外层创建事务并设置会话变量
+                await using var transaction = await followerContext.Database.BeginTransactionAsync();
+                
+                try
                 {
-                    bool success = await ProcessSingleChangeWithRetry(followerContext, tableConfig, change);
+                    // 设置会话变量防止从库触发器递归
+                    await followerContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 1");
+
+                    // 逐个处理变更
+                    foreach (var change in changes)
+                    {
+                        bool success = await ProcessSingleChangeWithRetry(followerContext, tableConfig, change);
+                        
+                        if (success)
+                        {
+                            successfulChanges.Add(change);
+                        }
+                        else
+                        {
+                            failedChanges.Add(change);
+                        }
+                    }
+
+                    // 重置会话变量
+                    await followerContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 0");
                     
-                    if (success)
-                    {
-                        successfulChanges.Add(change);
-                    }
-                    else
-                    {
-                        failedChanges.Add(change);
-                    }
+                    // 提交事务
+                    await transaction.CommitAsync();
+                    
+                    _logger.Info($"表 {tableConfig.TableName} 变更处理完成: 成功 {successfulChanges.Count} 条，失败 {failedChanges.Count} 条");
                 }
-
-                // 记录失败的变更到失败日志表
-                if (failedChanges.Any())
+                catch (Exception ex)
                 {
-                    await LogFailedChanges(failedChanges, tableConfig.TableName);
+                    // 回滚事务
+                    await transaction.RollbackAsync();
+                    _logger.Error($"表 {tableConfig.TableName} 事务处理失败，已回滚: {ex.Message}");
+                    throw;
                 }
-
-                _logger.Info($"表 {tableConfig.TableName} 变更处理完成: 成功 {successfulChanges.Count} 条，失败 {failedChanges.Count} 条");
             }
             catch (Exception ex)
             {
@@ -1066,7 +1144,6 @@ namespace DatabaseReplication.Follower
 
             if (primaryKeyProperty == null)
                 throw new InvalidOperationException($"找不到实体 {tableConfig.EntityType.Name} 的主键属性: {tableConfig.PrimaryKey}");
-
             var convertedValue = Convert.ChangeType(primaryKeyValue, primaryKeyProperty.PropertyType);
             // 对于删除操作，先查找已跟踪的实体
             var entityToDelete = await followerContext.FindAsync(tableConfig.EntityType, primaryKeyValue);
@@ -1310,6 +1387,13 @@ namespace DatabaseReplication.Follower
 
                         // 标记变更为已处理
                         await MarkFollowerChangesAsProcessed(followerContext, pendingChanges);
+                        
+                        // 更新从库到主库的同步进度
+                        if (pendingChanges.Any())
+                        {
+                            var lastProcessedId = pendingChanges.Max(c => c.Id);
+                            await UpdateSyncProgressToLeader(followerContext, tableConfig.TableName, lastProcessedId);
+                        }
 
                         _logger.Info($"成功将 {pendingChanges.Count} 条表 {tableConfig.TableName} 的变更推送到主库");
                     }
@@ -1326,6 +1410,9 @@ namespace DatabaseReplication.Follower
             FollowerDbContext followerContext,
             TableConfig tableConfig)
         {
+            // 获取当前表的从库到主库同步进度
+            var lastSyncedId = await GetLastSyncedIdToLeader(followerContext, tableConfig.TableName);
+            
             string statusTableName = $"replication_status_{_followerServerId}_to_leader";
 
             var sql = $@"
@@ -1334,62 +1421,134 @@ namespace DatabaseReplication.Follower
                 LEFT JOIN {statusTableName} s ON l.id = s.log_entry_id
                 WHERE l.table_name = @TableName
                   AND l.direction = 1
+                  AND l.id > @LastSyncedId
                   AND (s.is_synced IS NULL OR s.is_synced = 0)
-                ORDER BY l.timestamp ASC";
+                ORDER BY l.id ASC
+                LIMIT @BatchSize";
 
             return await followerContext.ReplicationLogs
-                .FromSqlRaw(sql, new MySqlParameter("@TableName", tableConfig.TableName))
+                .FromSqlRaw(sql, 
+                    new MySqlParameter("@TableName", tableConfig.TableName),
+                    new MySqlParameter("@LastSyncedId", lastSyncedId),
+                    new MySqlParameter("@BatchSize", _batchSize))
                 .ToListAsync();
         }
 
-        // 应用变更到主库
+        // 应用变更到主库（事务外移）
         private async Task ApplyChangesToLeader(
             LeaderDbContext leaderContext,
             TableConfig tableConfig,
             List<ReplicationLogEntry> changes)
         {
-            await ExecuteWithRetry(async () =>
-            {
-                await using var transaction = await leaderContext.Database.BeginTransactionAsync();
+            var successfulChanges = new List<ReplicationLogEntry>();
+            var failedChanges = new List<ReplicationLogEntry>();
 
+            try
+            {
+                // 对变更列表进行去重处理，确保对同一个主键的多次操作只处理最后一次
+                changes = DeduplicateChanges(changes, tableConfig.TableName);
+
+                // 在外层创建事务并设置会话变量
+                await using var transaction = await leaderContext.Database.BeginTransactionAsync();
+                
                 try
                 {
-                    // 对变更列表进行去重处理，确保对同一个主键的多次操作只处理最后一次
-                    changes = DeduplicateChanges(changes, tableConfig.TableName);
-                    
-                    // 批量操作开始时设置会话变量防止主库触发器递归
+                    // 设置会话变量防止主库触发器递归
                     await leaderContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 1");
 
+                    // 逐个处理变更
                     foreach (var change in changes)
                     {
-                        // 通过主键从从库获取完整实体
-                        var entity = await GetEntityFromFollower(tableConfig, change.Data);
-
-                        if (entity != null)
+                        bool success = await ProcessSingleChangeWithRetryToLeader(leaderContext, tableConfig, change);
+                        
+                        if (success)
                         {
-                            // 应用变更到主库
-                            await ApplyEntityChangeToLeader(leaderContext, tableConfig, change, entity);
+                            successfulChanges.Add(change);
                         }
-                        //else if (change.OperationType == ReplicationOperation.Delete)
-                        //{
-                        //    // 对于删除操作，如果实体不存在，直接执行删除
-                        //    await DeleteEntityInLeader(leaderContext, tableConfig, change.Data);
-                        //}
+                        else
+                        {
+                            failedChanges.Add(change);
+                        }
                     }
 
-                    await leaderContext.SaveChangesAsync();
-                    
-                    // 批量操作完成后重置会话变量
+                    // 重置会话变量
                     await leaderContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 0");
+                    
+                    // 提交事务
                     await transaction.CommitAsync();
+                    
+                    _logger.Info($"表 {tableConfig.TableName} 变更处理完成: 成功 {successfulChanges.Count} 条，失败 {failedChanges.Count} 条");
                 }
                 catch (Exception ex)
                 {
+                    // 回滚事务
                     await transaction.RollbackAsync();
-                    _logger.Error($"应用变更到主库时出错: {ex.Message}");
+                    _logger.Error($"表 {tableConfig.TableName} 事务处理失败，已回滚: {ex.Message}");
                     throw;
                 }
-            }, 3, 1000, $"应用变更到主库 - 表 {tableConfig.TableName}");
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"应用变更到主库时出错: {ex.Message}");
+                
+                // 如果整个过程失败，将所有变更记录为失败
+                await LogFailedChanges(changes, tableConfig.TableName, ex.Message);
+                throw;
+            }
+        }
+
+        // 处理单个变更的重试逻辑（从库到主库，事务外移）
+        private async Task<bool> ProcessSingleChangeWithRetryToLeader(
+            LeaderDbContext leaderContext,
+            TableConfig tableConfig,
+            ReplicationLogEntry change,
+            int maxRetries = 3)
+        {
+            Exception lastException = null;
+
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
+            {
+                try
+                {
+                    // 通过主键从从库获取完整实体
+                    var entity = await GetEntityFromFollower(tableConfig, change.Data);
+
+                    if (entity != null)
+                    {
+                        // 应用变更到主库
+                        await ApplyEntityChangeToLeader(leaderContext, tableConfig, change, entity);
+                    }
+                    else if (change.OperationType == ReplicationOperation.Delete)
+                    {
+                        // 对于删除操作，如果实体不存在，直接执行删除
+                        await DeleteEntityInLeader(leaderContext, tableConfig, change.Data);
+                    }
+
+                    // 每条数据调用一次SaveChanges
+                    await leaderContext.SaveChangesAsync();
+
+                    _logger.Info($"表 {tableConfig.TableName} 变更 ID {change.Id} 处理成功（从库到主库）");
+                    return true; // 成功处理
+                }
+                catch (Exception ex)
+                {
+                    lastException = ex;
+                    _logger.Warning($"表 {tableConfig.TableName} 变更 ID {change.Id} 第 {attempt} 次尝试失败（从库到主库）: {ex.Message}");
+
+                    if (attempt < maxRetries)
+                    {
+                        // 指数退避策略
+                        int delay = 1000 * (int)Math.Pow(2, attempt - 1);
+                        _logger.Info($"等待 {delay}ms 后进行第 {attempt + 1} 次重试...");
+                        await Task.Delay(delay);
+                    }
+                }
+            }
+
+            // 重试3次后仍然失败，记录失败数据
+            await LogFailedChange(change, tableConfig.TableName, lastException?.Message);
+            _logger.Error($"表 {tableConfig.TableName} 变更 ID {change.Id} 重试 {maxRetries} 次后仍然失败（从库到主库）: {lastException?.Message}");
+            return false; // 处理失败
         }
 
         // 从从库获取实体
