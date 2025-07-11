@@ -348,7 +348,7 @@ namespace DatabaseReplication.Follower
                     }
                 }
 
-                var columnList = string.Join(", ", columns);
+                var columnList = "`" + string.Join("`,`", columns ) + "`";
 
                 // 获取总行数
                 int totalRows = 0;
