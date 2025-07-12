@@ -6,6 +6,8 @@ using System.Reflection;
 using System.Linq;
 using DataBaseAsync;
 using DataBaseAsync;
+using System.Windows;
+using System.IO;
 
 namespace DatabaseReplication.Leader
 {
@@ -48,7 +50,24 @@ namespace DatabaseReplication.Leader
 
     class Program
     {
-        static async Task Main(string[] args)
+        [STAThread]
+        static void Main(string[] args)
+        {
+            // 检查是否以控制台模式运行
+            if (args.Length > 0 && args[0] == "--console")
+            {
+                RunConsoleMode(args).Wait();
+            }
+            else
+            {
+                // 启动WPF应用程序
+                var app = new Application();
+                var mainWindow = new MainWindow();
+                app.Run(mainWindow);
+            }
+        }
+        
+        private static async Task RunConsoleMode(string[] args)
         {
             // 初始化日志记录器
             var logger = Logger.Instance;

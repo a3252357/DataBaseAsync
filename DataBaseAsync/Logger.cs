@@ -11,9 +11,11 @@ namespace DataBaseAsync
     public class Logger
     {
         private static readonly Lazy<Logger> _instance = new Lazy<Logger>(() => new Logger());
-        private readonly string _logFilePath;
+        private string _logFilePath;
         private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
         private readonly object _lockObject = new object();
+        private const long MaxLogFileSizeBytes = 10 * 1024 * 1024; // 10MB
+        private long _currentLogSizeBytes = 0; // 当前日志文件累计大小
 
         public static Logger Instance => _instance.Value;
 
@@ -29,6 +31,9 @@ namespace DataBaseAsync
             // 生成日志文件名（按日期）
             string fileName = $"DatabaseReplication_{DateTime.Now:yyyyMMdd}.log";
             _logFilePath = Path.Combine(logDirectory, fileName);
+            
+            // 初始化当前文件大小
+            InitializeCurrentFileSize();
         }
 
         /// <summary>
@@ -45,10 +50,17 @@ namespace DataBaseAsync
                 // 输出到控制台
                 Console.WriteLine(formattedMessage);
                 
+                // 检查并轮转日志文件
+                CheckAndRotateLogFile();
+                
                 // 输出到文件
                 try
                 {
-                    File.AppendAllText(_logFilePath, formattedMessage + Environment.NewLine);
+                    string logLine = formattedMessage + Environment.NewLine;
+                    File.AppendAllText(_logFilePath, logLine);
+                    
+                    // 累计文件大小（估算）
+                    _currentLogSizeBytes += System.Text.Encoding.UTF8.GetByteCount(logLine);
                 }
                 catch (Exception ex)
                 {
@@ -73,10 +85,17 @@ namespace DataBaseAsync
                 // 输出到控制台
                 Console.WriteLine(formattedMessage);
                 
+                // 检查并轮转日志文件
+                CheckAndRotateLogFile();
+                
                 // 异步输出到文件
                 try
                 {
-                    await File.AppendAllTextAsync(_logFilePath, formattedMessage + Environment.NewLine);
+                    string logLine = formattedMessage + Environment.NewLine;
+                    await File.AppendAllTextAsync(_logFilePath, logLine);
+                    
+                    // 累计文件大小（估算）
+                    _currentLogSizeBytes += System.Text.Encoding.UTF8.GetByteCount(logLine);
                 }
                 catch (Exception ex)
                 {
@@ -148,6 +167,72 @@ namespace DataBaseAsync
             string timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff");
             string levelStr = level.ToString().ToUpper().PadRight(7);
             return $"[{timestamp}] [{levelStr}] {message}";
+        }
+
+        /// <summary>
+        /// 初始化当前文件大小
+        /// </summary>
+        private void InitializeCurrentFileSize()
+        {
+            try
+            {
+                if (File.Exists(_logFilePath))
+                {
+                    var fileInfo = new FileInfo(_logFilePath);
+                    _currentLogSizeBytes = fileInfo.Length;
+                }
+                else
+                {
+                    _currentLogSizeBytes = 0;
+                }
+            }
+            catch
+            {
+                _currentLogSizeBytes = 0;
+            }
+        }
+
+        /// <summary>
+        /// 检查并轮转日志文件
+        /// </summary>
+        private void CheckAndRotateLogFile()
+        {
+            try
+            {
+                // 使用累计大小检查，避免频繁的文件系统调用
+                if (_currentLogSizeBytes >= MaxLogFileSizeBytes)
+                {
+                    // 创建新的日志文件名
+                    string logDirectory = Path.GetDirectoryName(_logFilePath);
+                    string baseFileName = $"DatabaseReplication_{DateTime.Now:yyyyMMdd}";
+                    string extension = ".log";
+                    
+                    // 查找当前日期的日志文件数量，生成序号
+                    int fileIndex = 1;
+                    string newFileName;
+                    do
+                    {
+                        newFileName = Path.Combine(logDirectory, $"{baseFileName}_{fileIndex:D3}{extension}");
+                        fileIndex++;
+                    }
+                    while (File.Exists(newFileName));
+                    
+                    // 更新日志文件路径
+                    _logFilePath = newFileName;
+                    
+                    // 重置累计大小
+                    _currentLogSizeBytes = 0;
+                    
+                    // 记录日志轮转信息到新文件
+                    string rotationMessage = $"日志文件轮转: 前一个文件已达到大小限制 ({MaxLogFileSizeBytes / (1024 * 1024)}MB)";
+                    Console.WriteLine(FormatMessage(rotationMessage, LogLevel.Info));
+                }
+            }
+            catch (Exception ex)
+            {
+                // 如果轮转失败，记录错误但不影响正常日志写入
+                Console.WriteLine($"[ERROR] 日志文件轮转失败: {ex.Message}");
+            }
         }
 
         /// <summary>

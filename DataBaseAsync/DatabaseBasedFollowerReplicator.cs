@@ -650,13 +650,16 @@ namespace DatabaseReplication.Follower
                                         // 添加列映射
                                         foreach (var column in columns)
                                         {
-                                            bulkLoader.Columns.Add(column);
+                                            bulkLoader.Columns.Add("`"+column+"`");
                                         }
 
                                         // 将 DataReader 转换为 CSV 格式并加载
                                         bulkLoader.SourceStream = new DataReaderStream(reader);
                                         var rowsLoaded = await bulkLoader.LoadAsync();
                                         return (int)rowsLoaded;
+                                    }catch(Exception ex)
+                                    {
+
                                     }
                                     finally
                                     {
