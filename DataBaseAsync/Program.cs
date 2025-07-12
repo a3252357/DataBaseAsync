@@ -213,6 +213,7 @@ namespace DatabaseReplication.Leader
                     followerServerId,
                     followerConnectionString,
                     leaderConnectionString,
+                    config.LeaderReadOnlyConnectionString,
                     tableConfigs,
                     config.BatchSize,
                     config.DataRetentionDays,

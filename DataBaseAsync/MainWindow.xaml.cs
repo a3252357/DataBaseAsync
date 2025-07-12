@@ -33,6 +33,14 @@ namespace DataBaseAsync
         private const int MaxLogLines = 10000;
         private ConsoleRedirector _consoleRedirector;
         
+        // UI日志队列优化相关字段
+        private readonly System.Collections.Concurrent.ConcurrentQueue<string> _uiLogQueue = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        private readonly System.Threading.AutoResetEvent _uiLogEvent = new System.Threading.AutoResetEvent(false);
+        private readonly System.Threading.CancellationTokenSource _uiLogCancellationTokenSource = new System.Threading.CancellationTokenSource();
+        private System.Threading.Tasks.Task _uiLogProcessorTask;
+        private const int MaxUILogQueueSize = 1000;
+        private volatile bool _isUILogProcessorRunning = false;
+        
         public ObservableCollection<SyncStatusItem> LeaderToFollowerStatus { get; set; }
         public ObservableCollection<SyncStatusItem> FollowerToLeaderStatus { get; set; }
         public ObservableCollection<SyncStatusItem> LeaderToFollowerItems { get; set; } = new ObservableCollection<SyncStatusItem>();
@@ -50,6 +58,9 @@ namespace DataBaseAsync
             LoadConfiguration();
             LoadTableConfigurations(); // 在配置加载后重新加载表配置
             SetupConsoleRedirection();
+            
+            // 启动UI日志处理器
+            StartUILogProcessor();
             
             // 绑定表配置数据源
             TableConfigGrid.ItemsSource = TableConfigs;
@@ -75,12 +86,12 @@ namespace DataBaseAsync
                     return;
                 }
                 
-                using (var leaderDbContext = new LeaderDbContext(
-                    new DbContextOptionsBuilder<LeaderDbContext>()
-                        .UseMySql(ServerVersion.AutoDetect(_config.LeaderConnectionString))
-                        .Options,
-                    _config.LeaderConnectionString,
-                    _tableConfigs))
+                // 使用只读连接进行查询操作
+                var readOnlyConnectionString = !string.IsNullOrEmpty(_config.LeaderReadOnlyConnectionString) 
+                    ? _config.LeaderReadOnlyConnectionString 
+                    : _config.LeaderConnectionString;
+                    
+                using (var leaderDbContext = LeaderDbContext.CreateReadOnlyContext(readOnlyConnectionString, _tableConfigs))
                 {
                     // 再次检查运行状态
                     if (!_isRunning)
@@ -120,7 +131,7 @@ namespace DataBaseAsync
                             TableName = tableConfig.TableName,
                             LastSyncedId = hasProgress ? progress.LastSyncedId : 0,
                             LastSyncTime = hasProgress ? (progress.Item2 ?? DateTime.MinValue) : DateTime.MinValue,
-                            PendingCount = await GetPendingCountFromReplicationLogs(tableConfig, hasProgress ? progress.LastSyncedId : 0),
+                            PendingCount = await GetPendingCountFromReplicationLogs(tableConfig, hasProgress ? progress.LastSyncedId : 0, leaderDbContext),
                             Status = _isRunning ? "运行中" : "已停止"
                         };
                         
@@ -130,7 +141,60 @@ namespace DataBaseAsync
                         {
                             leaderToFollowerList.Add(statusItem);
                         }
-                        
+                    }
+                }
+
+                // 初始化从库上下文
+                using (var followerContext = new FollowerDbContext(
+                    new DbContextOptionsBuilder<FollowerDbContext>()
+                        .UseMySql(ServerVersion.AutoDetect(_config.FollowerConnectionString))
+                        .Options,
+                    _config.FollowerConnectionString,
+                    _config.FollowerServerId,
+                    _tableConfigs))
+                {
+                    // 再次检查运行状态
+                    if (!_isRunning)
+                    {
+                        return;
+                    }
+
+                    // 使用Entity Framework查询同步进度
+                    var syncProgresses = await followerContext.SyncProgresses
+                        .Where(sp => sp.FollowerServerId == _config.FollowerServerId)
+                        .ToListAsync();
+
+                    // 检查运行状态
+                    if (!_isRunning)
+                    {
+                        return;
+                    }
+
+                    var syncProgressDict = syncProgresses.ToDictionary(
+                        sp => sp.TableName,
+                        sp => (sp.LastSyncedId, (DateTime?)sp.LastSyncTime)
+                    );
+
+                    // 为每个配置的表创建状态项
+                    foreach (var tableConfig in _tableConfigs.Where(t => t.Enabled))
+                    {
+                        // 在每次循环中检查运行状态
+                        if (!_isRunning)
+                        {
+                            return;
+                        }
+
+                        var hasProgress = syncProgressDict.TryGetValue(tableConfig.TableName, out var progress);
+
+                        var statusItem = new SyncStatusItem
+                        {
+                            TableName = tableConfig.TableName,
+                            LastSyncedId = hasProgress ? progress.LastSyncedId : 0,
+                            LastSyncTime = hasProgress ? (progress.Item2 ?? DateTime.MinValue) : DateTime.MinValue,
+                            PendingCount = await GetPendingCountFromReplicationLogs(tableConfig, hasProgress ? progress.LastSyncedId : 0, followerContext),
+                            Status = _isRunning ? "运行中" : "已停止"
+                        };
+
                         if (tableConfig.ReplicationDirection == ReplicationDirection.FollowerToLeader ||
                             tableConfig.ReplicationDirection == ReplicationDirection.Bidirectional)
                         {
@@ -247,6 +311,7 @@ namespace DataBaseAsync
                 }
                 
                 LeaderConnectionTextBox.Text = _config.LeaderConnectionString;
+                LeaderReadOnlyConnectionTextBox.Text = _config.LeaderReadOnlyConnectionString ?? "";
                 FollowerConnectionTextBox.Text = _config.FollowerConnectionString;
                 IntervalTextBox.Text = "30"; // 显示默认间隔
                 BatchSizeTextBox.Text = _config.BatchSize.ToString();
@@ -398,6 +463,7 @@ namespace DataBaseAsync
                     _config.FollowerServerId,
                     _config.FollowerConnectionString,
                     _config.LeaderConnectionString,
+                     _config.LeaderReadOnlyConnectionString,
                     _tableConfigs,
                     _config.BatchSize,
                     _config.DataRetentionDays,
@@ -519,12 +585,8 @@ namespace DataBaseAsync
             try
             {
                 // 初始化主库上下文
-                using (var leaderContext = new LeaderDbContext(
-                    new DbContextOptionsBuilder<LeaderDbContext>()
-                        .UseMySql(ServerVersion.AutoDetect(_config.LeaderConnectionString))
-                        .Options,
-                    _config.LeaderConnectionString,
-                    _tableConfigs))
+                // 初始化操作需要写权限，使用主连接
+                using (var leaderContext = LeaderDbContext.CreateWriteContext(_config.LeaderConnectionString, _tableConfigs))
                 {
                     leaderContext.Initialize();
                     AddLog("主库初始化完成");
@@ -647,7 +709,7 @@ namespace DataBaseAsync
             }
         }
         
-        private async Task<int> GetPendingCountFromReplicationLogs(TableConfig tableConfig, int lastSyncedId)
+        private async Task<int> GetPendingCountFromReplicationLogs(TableConfig tableConfig, int lastSyncedId, DbContext dbContext)
         {
             try
             {
@@ -657,20 +719,18 @@ namespace DataBaseAsync
                     return 0;
                 }
                 
-                using (var leaderContext = new LeaderDbContext(
-                    new DbContextOptionsBuilder<LeaderDbContext>()
-                        .UseMySql(ServerVersion.AutoDetect(_config.LeaderConnectionString))
-                        .Options,
-                    _config.LeaderConnectionString,
-                    _tableConfigs))
-                {
+                // 使用只读连接进行查询操作
+                var readOnlyConnectionString = !string.IsNullOrEmpty(_config.LeaderReadOnlyConnectionString) 
+                    ? _config.LeaderReadOnlyConnectionString 
+                    : _config.LeaderConnectionString;
+                    
                     // 再次检查运行状态
                     if (!_isRunning)
                     {
                         return 0;
                     }
                     
-                    using (var connection = leaderContext.Database.GetDbConnection())
+                    using (var connection = dbContext.Database.GetDbConnection())
                     {
                         await connection.OpenAsync();
                         
@@ -705,14 +765,12 @@ namespace DataBaseAsync
                             return Convert.ToInt32(result);
                         }
                     }
-                }
             }
             catch
             {
                 return 0; // 如果查询失败，返回0
             }
         }
-        
         private async Task LoadBasicStatus()
         {
             // 显示基本的表配置信息
@@ -808,17 +866,11 @@ namespace DataBaseAsync
         {
             try
             {
-                var configuration = new ConfigurationBuilder()
-                    .SetBasePath(Directory.GetCurrentDirectory())
-                    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
-                    .Build();
-                
-                var timeSyncSection = configuration.GetSection("TimeSynchronization");
-                if (timeSyncSection.Exists())
+                if (_config.TimeSynchronization!=null)
                 {
-                    TimeSyncEnabledCheckBox.IsChecked = timeSyncSection.GetValue<bool>("Enabled");
-                    TimeSyncIntervalTextBox.Text = timeSyncSection.GetValue<int>("SyncIntervalMinutes").ToString();
-                    RequireElevatedPrivilegesCheckBox.IsChecked = timeSyncSection.GetValue<bool>("RequireElevatedPrivileges");
+                    TimeSyncEnabledCheckBox.IsChecked = _config.TimeSynchronization.Enabled;
+                    TimeSyncIntervalTextBox.Text = _config.TimeSynchronization.TimeSyncIntervalMinutes.ToString();
+                    RequireElevatedPrivilegesCheckBox.IsChecked = true;
                 }
                 else
                 {
@@ -918,6 +970,7 @@ namespace DataBaseAsync
                 
                 // 更新连接字符串
                 jsonObj["DatabaseReplication"]["LeaderConnectionString"] = LeaderConnectionTextBox.Text;
+                jsonObj["DatabaseReplication"]["LeaderReadOnlyConnectionString"] = string.IsNullOrWhiteSpace(LeaderReadOnlyConnectionTextBox.Text) ? null : LeaderReadOnlyConnectionTextBox.Text;
                 jsonObj["DatabaseReplication"]["FollowerConnectionString"] = FollowerConnectionTextBox.Text;
                 
                 // 保存文件
@@ -1038,6 +1091,7 @@ namespace DataBaseAsync
         {
             var logEntry = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}";
             
+            // 添加到内存日志列表
             lock (_logLines)
             {
                 _logLines.Add(logEntry);
@@ -1050,29 +1104,38 @@ namespace DataBaseAsync
                 }
             }
             
-            Dispatcher.Invoke(() =>
+            // 使用队列机制异步更新UI
+            if (_isUILogProcessorRunning)
             {
-                // 更新主界面底部的日志显示框
-                MainLogTextBox.AppendText(logEntry + Environment.NewLine);
-                MainLogTextBox.ScrollToEnd();
-                
-                // 更新详细日志选项卡的日志显示框
-                // 如果日志行数超过限制，重新构建整个文本
-                if (_logLines.Count >= MaxLogLines - 100) // 提前一点重建，避免频繁操作
+                // 检查队列大小，防止内存溢出
+                if (_uiLogQueue.Count < MaxUILogQueueSize)
                 {
-                    lock (_logLines)
-                    {
-                        LogTextBox.Text = string.Join(Environment.NewLine, _logLines) + Environment.NewLine;
-                    }
+                    _uiLogQueue.Enqueue(logEntry);
+                    _uiLogEvent.Set(); // 通知后台线程处理
                 }
                 else
                 {
-                    LogTextBox.AppendText(logEntry + Environment.NewLine);
+                    // 队列满时，丢弃最旧的日志条目
+                    _uiLogQueue.TryDequeue(out _);
+                    _uiLogQueue.Enqueue(logEntry);
+                    _uiLogEvent.Set();
                 }
-                
-                LogTextBox.ScrollToEnd();
-                StatusBarText.Text = message;
-            });
+            }
+            else
+            {
+                // 如果UI处理器未运行，回退到同步模式（启动阶段）
+                try
+                {
+                    Dispatcher.BeginInvoke(() =>
+                    {
+                        UpdateUIWithLogEntry(logEntry);
+                    }, System.Windows.Threading.DispatcherPriority.Background);
+                }
+                catch
+                {
+                    // 忽略UI更新错误
+                }
+            }
         }
         
         private void ClearMainLogButton_Click(object sender, RoutedEventArgs e)
@@ -1114,12 +1177,155 @@ namespace DataBaseAsync
             _consoleRedirector.Start();
         }
         
+        private void StartUILogProcessor()
+        {
+            if (_isUILogProcessorRunning)
+                return;
+                
+            _isUILogProcessorRunning = true;
+            _uiLogProcessorTask = Task.Run(async () =>
+            {
+                await ProcessUILogQueue(_uiLogCancellationTokenSource.Token);
+            });
+        }
+        
+        private async Task ProcessUILogQueue(System.Threading.CancellationToken cancellationToken)
+        {
+            var logBatch = new List<string>();
+            
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    // 等待日志事件或取消信号
+                    var waitHandles = new System.Threading.WaitHandle[] { _uiLogEvent, cancellationToken.WaitHandle };
+                    var signalIndex = System.Threading.WaitHandle.WaitAny(waitHandles, 100); // 100ms超时
+                    
+                    if (cancellationToken.IsCancellationRequested)
+                        break;
+                    
+                    // 批量收集日志条目
+                    logBatch.Clear();
+                    while (_uiLogQueue.TryDequeue(out string logEntry) && logBatch.Count < 50)
+                    {
+                        logBatch.Add(logEntry);
+                    }
+                    
+                    // 如果有日志条目，批量更新UI
+                    if (logBatch.Count > 0)
+                    {
+                        await Dispatcher.InvokeAsync(() =>
+                        {
+                            UpdateUIWithLogBatch(logBatch);
+                        }, System.Windows.Threading.DispatcherPriority.Background);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // 记录错误但继续处理
+                    System.Diagnostics.Debug.WriteLine($"UI日志处理器错误: {ex.Message}");
+                }
+            }
+        }
+        
+        private void UpdateUIWithLogBatch(List<string> logBatch)
+        {
+            try
+            {
+                if (logBatch == null || logBatch.Count == 0)
+                    return;
+                
+                // 批量构建日志文本
+                var batchText = string.Join(Environment.NewLine, logBatch) + Environment.NewLine;
+                
+                // 批量更新主界面底部的日志显示框
+                MainLogTextBox.AppendText(batchText);
+                MainLogTextBox.ScrollToEnd();
+                
+                // 批量更新详细日志选项卡的日志显示框
+                // 如果日志行数超过限制，重新构建整个文本
+                if (_logLines.Count >= MaxLogLines - 100) // 提前一点重建，避免频繁操作
+                {
+                    lock (_logLines)
+                    {
+                        LogTextBox.Text = string.Join(Environment.NewLine, _logLines) + Environment.NewLine;
+                    }
+                }
+                else
+                {
+                    LogTextBox.AppendText(batchText);
+                }
+                
+                LogTextBox.ScrollToEnd();
+                
+                // 更新状态栏为最后一条日志的消息
+                var lastLogEntry = logBatch[logBatch.Count - 1];
+                var messageStart = lastLogEntry.IndexOf("] ");
+                if (messageStart >= 0 && messageStart + 2 < lastLogEntry.Length)
+                {
+                    StatusBarText.Text = lastLogEntry.Substring(messageStart + 2);
+                }
+                else
+                {
+                    StatusBarText.Text = lastLogEntry;
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"批量更新UI日志时出错: {ex.Message}");
+            }
+        }
+        
+        private void UpdateUIWithLogEntry(string logEntry)
+        {
+            try
+            {
+                // 更新主界面底部的日志显示框
+                MainLogTextBox.AppendText(logEntry + Environment.NewLine);
+                MainLogTextBox.ScrollToEnd();
+                
+                // 更新详细日志选项卡的日志显示框
+                // 如果日志行数超过限制，重新构建整个文本
+                if (_logLines.Count >= MaxLogLines - 100) // 提前一点重建，避免频繁操作
+                {
+                    lock (_logLines)
+                    {
+                        LogTextBox.Text = string.Join(Environment.NewLine, _logLines) + Environment.NewLine;
+                    }
+                }
+                else
+                {
+                    LogTextBox.AppendText(logEntry + Environment.NewLine);
+                }
+                
+                LogTextBox.ScrollToEnd();
+                
+                // 从日志条目中提取消息部分更新状态栏
+                var messageStart = logEntry.IndexOf("] ");
+                if (messageStart >= 0 && messageStart + 2 < logEntry.Length)
+                {
+                    StatusBarText.Text = logEntry.Substring(messageStart + 2);
+                }
+                else
+                {
+                    StatusBarText.Text = logEntry;
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"更新UI日志时出错: {ex.Message}");
+            }
+        }
+        
         protected override void OnClosed(EventArgs e)
         {
             try
             {
                 // 首先设置运行状态为false，防止定时器继续执行数据库操作
                 _isRunning = false;
+                
+                // 停止UI日志处理器
+                StopUILogProcessor();
                 
                 // 停止所有定时器
                 _timeTimer?.Stop();
@@ -1171,6 +1377,36 @@ namespace DataBaseAsync
             finally
             {
                 base.OnClosed(e);
+            }
+        }
+        
+        private void StopUILogProcessor()
+        {
+            try
+            {
+                if (_isUILogProcessorRunning)
+                {
+                    _isUILogProcessorRunning = false;
+                    _uiLogCancellationTokenSource?.Cancel();
+                    _uiLogEvent?.Set(); // 唤醒处理线程以便退出
+                    
+                    // 等待处理器任务完成
+                    if (_uiLogProcessorTask != null && !_uiLogProcessorTask.IsCompleted)
+                    {
+                        if (!_uiLogProcessorTask.Wait(1000)) // 等待最多1秒
+                        {
+                            System.Diagnostics.Debug.WriteLine("UI日志处理器停止超时");
+                        }
+                    }
+                }
+                
+                // 释放资源
+                _uiLogEvent?.Dispose();
+                _uiLogCancellationTokenSource?.Dispose();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"停止UI日志处理器时出错: {ex.Message}");
             }
         }
     }

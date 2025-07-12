@@ -6,6 +6,7 @@ namespace DatabaseReplication.Leader
     {
         public bool InitializeExistingData { get; set; }
         public string LeaderConnectionString { get; set; } = string.Empty;
+        public string LeaderReadOnlyConnectionString { get; set; } = string.Empty;
         public string FollowerConnectionString { get; set; } = string.Empty;
         public string FollowerServerId { get; set; } = string.Empty;
         public int BatchSize { get; set; } = 1000; // 每批处理的记录数量，默认1000条

@@ -1,4 +1,4 @@
-﻿using Coldairarrow.bgmj.Entity;
+using Coldairarrow.bgmj.Entity;
 using Microsoft.EntityFrameworkCore;
 using MySqlConnector;
 using System;
@@ -20,6 +20,7 @@ namespace DatabaseReplication.Follower
         private readonly string _followerServerId;
         private readonly string _followerConnectionString;
         private readonly string _leaderConnectionString;
+        private readonly string _leaderReadOnlyConnectionString;
         private readonly List<TableConfig> _tableConfigs;
         private readonly Dictionary<string, Timer> _timers = new Dictionary<string, Timer>();
         private readonly Dictionary<string, bool> _executionFlags = new Dictionary<string, bool>();
@@ -37,6 +38,7 @@ namespace DatabaseReplication.Follower
             string followerServerId,
             string followerConnectionString,
             string leaderConnectionString,
+            string leaderReadOnlyConnectionString,
             List<TableConfig> tableConfigs,
             int batchSize = 1000,
             int dataRetentionDays = 30,
@@ -45,6 +47,10 @@ namespace DatabaseReplication.Follower
             _followerServerId = followerServerId;
             _followerConnectionString = followerConnectionString;
             _leaderConnectionString = leaderConnectionString;
+            // 如果没有配置只读连接字符串，则使用主库连接字符串
+            _leaderReadOnlyConnectionString = string.IsNullOrWhiteSpace(leaderReadOnlyConnectionString) 
+                ? leaderConnectionString 
+                : leaderReadOnlyConnectionString;
             _tableConfigs = tableConfigs;
             _batchSize = batchSize;
             _dataRetentionDays = dataRetentionDays;
@@ -325,9 +331,9 @@ namespace DatabaseReplication.Follower
         // 复制表数据
         private async Task CopyTableData(TableConfig tableConfig, int maxConcurrency = 4)
         {
-            _logger.Info($"从 {_leaderConnectionString} 复制表 {tableConfig.TableName} 数据到 {_followerConnectionString}...");
+            _logger.Info($"从 {_leaderReadOnlyConnectionString} 复制表 {tableConfig.TableName} 数据到 {_followerConnectionString}...");
 
-            using (var sourceConnection = new MySqlConnection(_leaderConnectionString))
+            using (var sourceConnection = new MySqlConnection(_leaderReadOnlyConnectionString))
             {
                 await sourceConnection.OpenAsync();
 
@@ -657,9 +663,6 @@ namespace DatabaseReplication.Follower
                                         bulkLoader.SourceStream = new DataReaderStream(reader);
                                         var rowsLoaded = await bulkLoader.LoadAsync();
                                         return (int)rowsLoaded;
-                                    }catch(Exception ex)
-                                    {
-
                                     }
                                     finally
                                     {
@@ -769,11 +772,11 @@ namespace DatabaseReplication.Follower
         {
             await ExecuteWithRetry(async () =>
             {
-                using (var leaderContext = CreateLeaderDbContext())
+                using (var leaderReadContext = CreateLeaderDbContextForRead())
                 using (var followerContext = CreateFollowerDbContext())
                 {
                     // 获取主库待同步的变更
-                    var pendingChanges = await GetPendingChangesFromLeader(leaderContext, tableConfig);
+                    var pendingChanges = await GetPendingChangesFromLeader(leaderReadContext, tableConfig);
 
                     if (pendingChanges.Any())
                     {
@@ -782,8 +785,11 @@ namespace DatabaseReplication.Follower
                         // 应用变更到从库
                         await ApplyChangesToFollower(followerContext, tableConfig, pendingChanges);
 
-                        // 标记变更为已处理
-                        await MarkChangesAsProcessed(leaderContext, pendingChanges);
+                        // 标记变更为已处理（需要写操作，使用写上下文）
+                        using (var leaderWriteContext = CreateLeaderDbContext())
+                        {
+                            await MarkChangesAsProcessed(leaderWriteContext, pendingChanges);
+                        }
 
                         _logger.Info($"成功将 {pendingChanges.Count} 条表 {tableConfig.TableName} 的变更应用到从库");
                     }
@@ -1031,7 +1037,7 @@ namespace DatabaseReplication.Follower
         // 从主库获取实体
         private async Task<object> GetEntityFromLeader(TableConfig tableConfig, string primaryKeyValue)
         {
-            using (var leaderContext = CreateLeaderDbContext())
+            using (var leaderContext = CreateLeaderDbContextForRead())
             {
                 var primaryKeyProperty = tableConfig.EntityType.GetProperty(tableConfig.PrimaryKey);
 
@@ -1375,31 +1381,32 @@ namespace DatabaseReplication.Follower
         {
             try
             {
-                using (var leaderContext = CreateLeaderDbContext())
+                List<ReplicationLogEntry> pendingChanges;
+                
+                // 第一步：获取待同步的变更
                 using (var followerContext = CreateFollowerDbContext())
                 {
-                    // 获取从库待同步的变更
-                    var pendingChanges = await GetPendingChangesFromFollower(followerContext, tableConfig);
+                    pendingChanges = await GetPendingChangesFromFollower(followerContext, tableConfig);
+                }
 
-                    if (pendingChanges.Any())
+                if (pendingChanges.Any())
+                {
+                    _logger.Info($"从从库拉取了 {pendingChanges.Count} 条表 {tableConfig.TableName} 的变更，准备推送到主库");
+
+                    // 第二步：应用变更到主库
+                    using (var leaderContext = CreateLeaderDbContext())
                     {
-                        _logger.Info($"从从库拉取了 {pendingChanges.Count} 条表 {tableConfig.TableName} 的变更，准备推送到主库");
-
-                        // 应用变更到主库
                         await ApplyChangesToLeader(leaderContext, tableConfig, pendingChanges);
-
-                        // 标记变更为已处理
-                        await MarkFollowerChangesAsProcessed(followerContext, pendingChanges);
-                        
-                        // 更新从库到主库的同步进度
-                        if (pendingChanges.Any())
-                        {
-                            var lastProcessedId = pendingChanges.Max(c => c.Id);
-                            await UpdateSyncProgressToLeader(followerContext, tableConfig.TableName, lastProcessedId);
-                        }
-
-                        _logger.Info($"成功将 {pendingChanges.Count} 条表 {tableConfig.TableName} 的变更推送到主库");
                     }
+
+                    // 第三步：标记变更为已处理并更新同步进度
+                    using (var followerContext = CreateFollowerDbContext())
+                    {
+                        // 标记变更为已处理
+                        await MarkFollowerChangesAsProcessed(followerContext, pendingChanges, tableConfig);
+                    }
+
+                    _logger.Info($"成功将 {pendingChanges.Count} 条表 {tableConfig.TableName} 的变更推送到主库");
                 }
             }
             catch (Exception ex)
@@ -1690,12 +1697,14 @@ namespace DatabaseReplication.Follower
         // 标记从库变更为已处理
         private async Task MarkFollowerChangesAsProcessed(
             FollowerDbContext followerContext,
-            List<ReplicationLogEntry> changes)
+            List<ReplicationLogEntry> changes, TableConfig tableConfig)
         {
             await ExecuteWithRetry(async () =>
             {
                 string statusTableName = $"replication_status_{_followerServerId}_to_leader";
+                int lastProcessedId = (int)changes.Max(c => c.Id);
 
+                // 第一步：标记复制状态
                 using (var connection = (MySqlConnection)followerContext.Database.GetDbConnection())
                 {
                     await connection.OpenAsync();
@@ -1719,8 +1728,10 @@ namespace DatabaseReplication.Follower
                                 await command.ExecuteNonQueryAsync();
                             }
                         }
-
                         await transaction.CommitAsync();
+
+                        // 第二步：更新同步进度（使用独立的DbContext事务）
+                        await UpdateSyncProgressToLeader(followerContext, tableConfig.TableName, lastProcessedId);
                     }
                     catch (Exception ex)
                     {
@@ -1740,6 +1751,17 @@ namespace DatabaseReplication.Follower
                     .UseMySql(ServerVersion.AutoDetect(_leaderConnectionString))
                     .Options,
                 _leaderConnectionString,
+                _tableConfigs);
+        }
+
+        // 创建主库只读上下文
+        private LeaderDbContext CreateLeaderDbContextForRead()
+        {
+            return new LeaderDbContext(
+                new DbContextOptionsBuilder<LeaderDbContext>()
+                    .UseMySql(ServerVersion.AutoDetect(_leaderReadOnlyConnectionString))
+                    .Options,
+                _leaderReadOnlyConnectionString,
                 _tableConfigs);
         }
 
@@ -1869,7 +1891,7 @@ namespace DatabaseReplication.Follower
             try
             {
                 using var followerContext = CreateFollowerDbContext();
-                using var leaderContext = CreateLeaderDbContext();
+                using var leaderContext = CreateLeaderDbContextForRead();
                 
                 foreach (var change in changes)
                 {
@@ -2358,7 +2380,7 @@ namespace DatabaseReplication.Follower
             
             try
             {
-                using var leaderContext = CreateLeaderDbContext();
+                using var leaderContext = CreateLeaderDbContextForRead();
                 using var followerContext = CreateFollowerDbContext();
                 
                 foreach (var tableConfig in _tableConfigs.Where(t => t.Enabled))
@@ -2499,11 +2521,11 @@ namespace DatabaseReplication.Follower
         {
             try
             {
-                using var leaderContext = CreateLeaderDbContext();
+                using var leaderReadContext = CreateLeaderDbContextForRead();
                 using var followerContext = CreateFollowerDbContext();
                 
                 // 获取指定时间之后的所有变更
-                var missedChanges = await leaderContext.ReplicationLogs
+                var missedChanges = await leaderReadContext.ReplicationLogs
                     .Where(l => l.TableName == tableConfig.TableName &&
                                l.Timestamp > fromTime &&
                                l.Direction == ReplicationDirection.LeaderToFollower)
@@ -2519,7 +2541,10 @@ namespace DatabaseReplication.Follower
                     foreach (var batch in batches)
                     {
                         await ApplyChangesToFollower(followerContext, tableConfig, batch.ToList());
-                        await MarkChangesAsProcessed(leaderContext, batch.ToList());
+                        
+                        // 为写操作创建新的上下文
+                        using var leaderWriteContext = CreateLeaderDbContext();
+                        await MarkChangesAsProcessed(leaderWriteContext, batch.ToList());
                     }
                     
                     _logger.Info($"表 {tableConfig.TableName} 强制同步完成");
@@ -2579,7 +2604,7 @@ namespace DatabaseReplication.Follower
                 var primaryKeyProperty = tableConfig.EntityType.GetProperty(tableConfig.PrimaryKey);
                 var primaryKeyValue = primaryKeyProperty.GetValue(leaderEntity)?.ToString();
                 
-                using (var leaderContext = CreateLeaderDbContext())
+                using (var leaderContext = CreateLeaderDbContextForRead())
                 {
                     // 查找主库中该记录在从库变更时间之后的最新变更
                     var latestLeaderLog = leaderContext.ReplicationLogs

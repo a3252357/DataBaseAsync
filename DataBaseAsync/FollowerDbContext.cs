@@ -200,6 +200,86 @@ namespace DatabaseReplication
             ExecuteSql(createTableSql);
         }
 
+        // 检查触发器定义是否相同
+        private bool IsTriggerDefinitionSame(MySqlConnection connection, string triggerName, string expectedTriggerBody)
+        {
+            try
+            {
+                string checkSql = @"
+                    SELECT TRIGGER_NAME, ACTION_STATEMENT 
+                    FROM INFORMATION_SCHEMA.TRIGGERS 
+                    WHERE TRIGGER_SCHEMA = DATABASE() 
+                    AND TRIGGER_NAME = @triggerName";
+
+                using (var command = new MySqlCommand(checkSql, connection))
+                {
+                    command.Parameters.AddWithValue("@triggerName", triggerName);
+                    using (var reader = command.ExecuteReader())
+                    {
+                        if (reader.Read())
+                        {
+                            string existingDefinition = reader.GetString("ACTION_STATEMENT");
+                            
+                            // 标准化两个定义进行比较（移除多余空格、换行符等）
+                            string normalizedExpected = NormalizeTriggerDefinition(expectedTriggerBody);
+                            string normalizedExisting = NormalizeTriggerDefinition(existingDefinition);
+                            
+                            _logger.Info($"触发器 {triggerName} 检查:");
+                            
+                            bool isEqual = normalizedExpected.Equals(normalizedExisting, StringComparison.OrdinalIgnoreCase);
+                            _logger.Info($"定义是否相同: {isEqual}");
+                            
+                            return isEqual;
+                        }
+                        else
+                        {
+                            _logger.Info($"触发器 {triggerName} 不存在");
+                        }
+                    }
+                }
+                
+                // 触发器不存在
+                return false;
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"检查触发器 {triggerName} 定义时出错: {ex.Message}");
+                return false;
+            }
+        }
+
+        // 标准化触发器定义，用于比较
+        private string NormalizeTriggerDefinition(string definition)
+        {
+            if (string.IsNullOrEmpty(definition))
+                return string.Empty;
+
+            // 移除多余的空格、制表符、换行符
+            string normalized = System.Text.RegularExpressions.Regex.Replace(definition.Trim(), @"\s+", " ")
+                .Replace("\r\n", " ")
+                .Replace("\n", " ")
+                .Replace("\r", " ")
+                .Replace("\t", " ")
+                .Trim();
+            
+            // MySQL存储的触发器定义可能不包含AFTER INSERT ON部分，只包含BEGIN...END部分
+            // 如果定义以BEGIN开头，说明是MySQL存储的ACTION_STATEMENT格式
+            if (normalized.StartsWith("BEGIN", StringComparison.OrdinalIgnoreCase))
+            {
+                // 只比较BEGIN...END部分
+                return normalized;
+            }
+            
+            // 如果是完整的触发器定义，提取BEGIN...END部分
+            int beginIndex = normalized.IndexOf("BEGIN", StringComparison.OrdinalIgnoreCase);
+            if (beginIndex >= 0)
+            {
+                return normalized.Substring(beginIndex);
+            }
+            
+            return normalized;
+        }
+
         // 创建复制触发器（仅用于双向复制或从库到主库复制的表）
         public void CreateReplicationTriggers()
         {
@@ -222,11 +302,7 @@ namespace DatabaseReplication
         private void CreateInsertTrigger(MySqlConnection connection, TableConfig tableConfig)
         {
             string triggerName = $"tr_{tableConfig.TableName}_insert";
-            string triggerSql = $@"
-                DROP TRIGGER IF EXISTS `{triggerName}`;
-                
-                CREATE TRIGGER `{triggerName}`
-                AFTER INSERT ON `{tableConfig.TableName}`
+            string expectedTriggerBody = $@"AFTER INSERT ON `{tableConfig.TableName}`
                 FOR EACH ROW
                 BEGIN
                     -- 防止触发器递归
@@ -245,18 +321,28 @@ namespace DatabaseReplication
                     END IF;
                 END";
 
+            // 检查触发器是否存在且定义相同
+            if (IsTriggerDefinitionSame(connection, triggerName, expectedTriggerBody))
+            {
+                _logger.Info($"触发器 {triggerName} 已存在且定义相同，跳过创建");
+                return;
+            }
+
+            string triggerSql = $@"
+                DROP TRIGGER IF EXISTS `{triggerName}`;
+                
+                CREATE TRIGGER `{triggerName}`
+                {expectedTriggerBody}";
+
             ExecuteSql(connection, triggerSql);
+            _logger.Info($"触发器 {triggerName} 创建完成");
         }
 
         // 创建更新触发器
         private void CreateUpdateTrigger(MySqlConnection connection, TableConfig tableConfig)
         {
             string triggerName = $"tr_{tableConfig.TableName}_update";
-            string triggerSql = $@"
-                DROP TRIGGER IF EXISTS `{triggerName}`;
-                
-                CREATE TRIGGER `{triggerName}`
-                AFTER UPDATE ON `{tableConfig.TableName}`
+            string expectedTriggerBody = $@"AFTER UPDATE ON `{tableConfig.TableName}`
                 FOR EACH ROW
                 BEGIN
                     -- 防止触发器递归
@@ -275,18 +361,28 @@ namespace DatabaseReplication
                     END IF;
                 END";
 
+            // 检查触发器是否存在且定义相同
+            if (IsTriggerDefinitionSame(connection, triggerName, expectedTriggerBody))
+            {
+                _logger.Info($"触发器 {triggerName} 已存在且定义相同，跳过创建");
+                return;
+            }
+
+            string triggerSql = $@"
+                DROP TRIGGER IF EXISTS `{triggerName}`;
+                
+                CREATE TRIGGER `{triggerName}`
+                {expectedTriggerBody}";
+
             ExecuteSql(connection, triggerSql);
+            _logger.Info($"触发器 {triggerName} 创建完成");
         }
 
         // 创建删除触发器
         private void CreateDeleteTrigger(MySqlConnection connection, TableConfig tableConfig)
         {
             string triggerName = $"tr_{tableConfig.TableName}_delete";
-            string triggerSql = $@"
-                DROP TRIGGER IF EXISTS `{triggerName}`;
-                
-                CREATE TRIGGER `{triggerName}`
-                AFTER DELETE ON `{tableConfig.TableName}`
+            string expectedTriggerBody = $@"AFTER DELETE ON `{tableConfig.TableName}`
                 FOR EACH ROW
                 BEGIN
                     -- 防止触发器递归
@@ -305,7 +401,21 @@ namespace DatabaseReplication
                     END IF;
                 END";
 
+            // 检查触发器是否存在且定义相同
+            if (IsTriggerDefinitionSame(connection, triggerName, expectedTriggerBody))
+            {
+                _logger.Info($"触发器 {triggerName} 已存在且定义相同，跳过创建");
+                return;
+            }
+
+            string triggerSql = $@"
+                DROP TRIGGER IF EXISTS `{triggerName}`;
+                
+                CREATE TRIGGER `{triggerName}`
+                {expectedTriggerBody}";
+
             ExecuteSql(connection, triggerSql);
+            _logger.Info($"触发器 {triggerName} 创建完成");
         }
 
         // 执行SQL语句

@@ -55,7 +55,7 @@
                             <DataGrid.Columns>
                                 <DataGridTextColumn Header="表名" Binding="{Binding TableName}" Width="120"/>
                                 <DataGridTextColumn Header="最后同步ID" Binding="{Binding LastSyncedId}" Width="100"/>
-                                <DataGridTextColumn Header="最后同步时间" Binding="{Binding LastSyncTime, StringFormat='MM-dd HH:mm:ss'}" Width="150"/>
+                                <DataGridTextColumn Header="最后同步时间" Binding="{Binding LastSyncTime, StringFormat='yyyy-MM-dd HH:mm:ss'}" Width="150"/>
                                 <DataGridTextColumn Header="待同步数量" Binding="{Binding PendingCount}" Width="100"/>
                                 <DataGridTextColumn Header="状态" Binding="{Binding Status}" Width="80"/>
                             </DataGrid.Columns>
@@ -74,19 +74,24 @@
                                     <RowDefinition Height="Auto"/>
                                     <RowDefinition Height="Auto"/>
                                     <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
                                 </Grid.RowDefinitions>
                                 <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="100"/>
+                                    <ColumnDefinition Width="120"/>
                                     <ColumnDefinition Width="*"/>
                                 </Grid.ColumnDefinitions>
                                 
                                 <TextBlock Grid.Row="0" Grid.Column="0" Text="主库连接:" VerticalAlignment="Center" Margin="5"/>
                                 <TextBox Grid.Row="0" Grid.Column="1" Name="LeaderConnectionTextBox" Margin="5" Height="25"/>
                                 
-                                <TextBlock Grid.Row="1" Grid.Column="0" Text="从库连接:" VerticalAlignment="Center" Margin="5"/>
-                                <TextBox Grid.Row="1" Grid.Column="1" Name="FollowerConnectionTextBox" Margin="5" Height="25"/>
+                                <TextBlock Grid.Row="1" Grid.Column="0" Text="主库只读连接:" VerticalAlignment="Center" Margin="5"/>
+                                <TextBox Grid.Row="1" Grid.Column="1" Name="LeaderReadOnlyConnectionTextBox" Margin="5" Height="25" 
+                                         ToolTip="可选：用于查询操作的只读连接，如果为空则使用主库连接"/>
                                 
-                                <Button Grid.Row="2" Grid.Column="1" Content="保存配置" Width="100" Height="30" 
+                                <TextBlock Grid.Row="2" Grid.Column="0" Text="从库连接:" VerticalAlignment="Center" Margin="5"/>
+                                <TextBox Grid.Row="2" Grid.Column="1" Name="FollowerConnectionTextBox" Margin="5" Height="25"/>
+                                
+                                <Button Grid.Row="3" Grid.Column="1" Content="保存配置" Width="100" Height="30" 
                                         HorizontalAlignment="Left" Margin="5" Click="SaveConfigButton_Click" IsEnabled="False"/>
                             </Grid>
                         </GroupBox>
