@@ -247,7 +247,8 @@ namespace DatabaseReplication
                   PRIMARY KEY (`id`),
                   KEY `idx_table_operation` (`table_name`,`operation_type`),
                   KEY `idx_timestamp` (`timestamp`),
-                  KEY `idx_operation_id` (`operation_id`)
+                  KEY `idx_operation_id` (`operation_id`),
+                  KEY `idx_id_table_name` (`id`,`table_name`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
 
             ExecuteSql(createTableSql);
