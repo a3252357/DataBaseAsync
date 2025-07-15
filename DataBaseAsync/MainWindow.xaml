@@ -19,6 +19,8 @@
                         Background="#E74C3C" Foreground="White" FontWeight="Bold" Click="StopButton_Click"/>
                 <Button Name="RefreshButton" Content="刷新状态" Width="100" Height="35" Margin="5" 
                         Background="#3498DB" Foreground="White" FontWeight="Bold" Click="RefreshButton_Click"/>
+                <Button Name="ManualRetryButton" Content="手动重试" Width="100" Height="35" Margin="5" 
+                        Background="#F39C12" Foreground="White" FontWeight="Bold" Click="ManualRetryButton_Click"/>
                 <TextBlock Text="同步状态:" Foreground="White" VerticalAlignment="Center" Margin="20,0,5,0" FontWeight="Bold"/>
                 <TextBlock Name="StatusText" Text="未启动" Foreground="#F39C12" VerticalAlignment="Center" FontWeight="Bold"/>
             </StackPanel>

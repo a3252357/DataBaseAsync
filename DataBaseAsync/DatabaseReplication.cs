@@ -174,4 +174,13 @@ namespace DatabaseReplication
         public DateTime LastSyncTime { get; set; }
         // 移除用户提供但代码中未使用的字段：SourceServer, TargetServer, Direction, IsActive
     }
+
+    // 手动重试结果
+    public class ManualRetryResult
+    {
+        public bool Success { get; set; }
+        public string Message { get; set; }
+        public int ProcessedCount { get; set; }
+        public Dictionary<string, int> ProcessedTables { get; set; } = new Dictionary<string, int>();
+    }
 }

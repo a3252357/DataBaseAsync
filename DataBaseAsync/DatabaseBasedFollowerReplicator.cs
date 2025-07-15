@@ -2709,6 +2709,229 @@ namespace DatabaseReplication.Follower
             return deduplicatedChanges;
         }
 
+        // 手动重试失败的数据
+        public async Task<ManualRetryResult> ManualRetryFailedData(string tableName = null)
+        {
+            var result = new ManualRetryResult();
+            
+            try
+            {
+                _logger.Info("开始手动重试失败的数据...");
+                
+                using var leaderContext = CreateLeaderDbContext();
+                
+                // 获取失败的数据，按表名过滤（如果指定）
+                var failedLogsQuery = leaderContext.ReplicationFailureLogs
+                    .Where(f => f.FollowerServerId == _followerServerId);
+                    
+                if (!string.IsNullOrEmpty(tableName))
+                {
+                    failedLogsQuery = failedLogsQuery.Where(f => f.TableName == tableName);
+                }
+                
+                var failedLogs = await failedLogsQuery
+                    .OrderBy(f => f.Id) // 按ID排序，确保从最早的错误开始
+                    .ToListAsync();
+                
+                if (!failedLogs.Any())
+                {
+                    _logger.Info("没有找到需要重试的失败数据");
+                    result.Success = true;
+                    result.Message = "没有找到需要重试的失败数据";
+                    result.ProcessedCount = 0;
+                    return result;
+                }
+                
+                // 按表名分组处理
+                var failedLogsByTable = failedLogs.GroupBy(f => f.TableName);
+                
+                foreach (var tableGroup in failedLogsByTable)
+                {
+                    var currentTableName = tableGroup.Key;
+                    var tableFailedLogs = tableGroup.OrderBy(f => f.Id).ToList();
+                    
+                    _logger.Info($"处理表 {currentTableName} 的 {tableFailedLogs.Count} 条失败数据");
+                    
+                    // 获取最早的失败数据ID
+                    var earliestFailedId = tableFailedLogs.First().Id;
+                    
+                    _logger.Info($"表 {currentTableName} 最早的失败数据ID: {earliestFailedId}");
+                    
+                    // 将同步进度设置到最早失败数据之前
+                    await ResetSyncProgressBeforeFailedData(leaderContext, currentTableName, earliestFailedId);
+                    
+                    // 删除失败数据对应的复制日志记录
+                    await ClearReplicationLogs(leaderContext, tableFailedLogs);
+                    
+                    // 删除失败数据的记录
+                    await ClearFailedDataLogs(leaderContext, tableFailedLogs);
+                    
+                    result.ProcessedTables.Add(currentTableName, tableFailedLogs.Count);
+                    result.ProcessedCount += tableFailedLogs.Count;
+                }
+                
+                await leaderContext.SaveChangesAsync();
+                
+                result.Success = true;
+                result.Message = $"手动重试设置完成，已处理 {result.ProcessedCount} 条失败数据，系统将自动重新同步这些数据";
+                _logger.Info(result.Message);
+                
+                return result;
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"手动重试失败数据时出错: {ex.Message}");
+                result.Success = false;
+                result.Message = $"手动重试失败: {ex.Message}";
+                return result;
+            }
+        }
+        
+        // 将同步进度重置到失败数据之前
+        private async Task ResetSyncProgressBeforeFailedData(LeaderDbContext leaderContext, string tableName, int earliestFailedId)
+        {
+            try
+            {
+                // 将同步进度设置到最早失败数据之前
+                var newSyncId = earliestFailedId - 1;
+                
+                // 确保不会设置为负数
+                if (newSyncId < 0)
+                {
+                    newSyncId = 0;
+                }
+                
+                // 获取当前的同步进度
+                var syncProgress = await leaderContext.SyncProgresses
+                    .FirstOrDefaultAsync(sp => sp.TableName == tableName && sp.FollowerServerId == _followerServerId);
+                
+                if (syncProgress != null)
+                {
+                    var originalSyncId = syncProgress.LastSyncedId;
+                    
+                    // 更新现有的同步进度记录
+                    syncProgress.LastSyncedId = newSyncId;
+                    syncProgress.LastSyncTime = DateTime.Now;
+                    _logger.Info($"表 {tableName} 更新同步进度记录，从 {originalSyncId} 重置为 {newSyncId}");
+                }
+                else
+                {
+                    // 如果不存在同步进度记录，则创建新的
+                    var newSyncProgress = new SyncProgress
+                    {
+                        TableName = tableName,
+                        FollowerServerId = _followerServerId,
+                        LastSyncedId = newSyncId,
+                        LastSyncTime = DateTime.Now
+                    };
+                    
+                    leaderContext.SyncProgresses.Add(newSyncProgress);
+                    _logger.Info($"表 {tableName} 创建新的同步进度记录，设置为 {newSyncId}");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"重置表 {tableName} 同步进度时出错: {ex.Message}");
+                throw;
+            }
+        }
+        
+        // 清理失败数据对应的复制日志记录
+        private async Task ClearReplicationLogs(LeaderDbContext leaderContext, List<ReplicationFailureLog> failedLogs)
+        {
+            try
+            {
+                // 提取失败日志中的复制日志ID
+                var replicationLogIds = failedLogs
+                    .Select(fl => fl.Id)
+                    .Distinct()
+                    .ToList();
+                
+                if (replicationLogIds.Any())
+                {
+                    // 删除对应的复制日志记录
+                    var replicationLogsToDelete = await leaderContext.ReplicationLogs
+                        .Where(rl => replicationLogIds.Contains(rl.Id))
+                        .ToListAsync();
+                    
+                    if (replicationLogsToDelete.Any())
+                    {
+                        leaderContext.ReplicationLogs.RemoveRange(replicationLogsToDelete);
+                        _logger.Info($"已清理 {replicationLogsToDelete.Count} 条失败数据对应的复制日志记录");
+                        
+                        // 记录清理的详细信息
+                        foreach (var log in replicationLogsToDelete.Take(5)) // 只记录前5条详细信息
+                        {
+                            _logger.Debug($"清理复制日志: 表={log.TableName}, ID={log.Id}, 操作={log.OperationType}, 时间={log.Timestamp}");
+                        }
+                        
+                        if (replicationLogsToDelete.Count > 5)
+                        {
+                            _logger.Debug($"... 还有 {replicationLogsToDelete.Count - 5} 条记录被清理");
+                        }
+                    }
+                    else
+                    {
+                        _logger.Info($"没有找到对应的复制日志记录需要清理");
+                    }
+                }
+                else
+                {
+                    _logger.Info($"失败日志中没有关联的复制日志ID，跳过复制日志清理");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"清理失败数据对应的复制日志时出错: {ex.Message}");
+                throw;
+            }
+        }
+        
+        // 清理失败数据的日志记录
+        private async Task ClearFailedDataLogs(LeaderDbContext leaderContext, List<ReplicationFailureLog> failedLogs)
+        {
+            try
+            {
+                // 删除失败日志记录
+                leaderContext.ReplicationFailureLogs.RemoveRange(failedLogs);
+                
+                _logger.Info($"已清理 {failedLogs.Count} 条失败数据日志记录");
+                
+                // 记录清理的详细信息
+                foreach (var log in failedLogs)
+                {
+                    _logger.Debug($"清理失败日志: 表={log.TableName}, ID={log.Id}, 操作={log.OperationType}, 错误={log.ErrorMessage}");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"清理失败数据日志时出错: {ex.Message}");
+                throw;
+            }
+        }
+        
+        // 获取失败数据的统计信息
+        public async Task<Dictionary<string, int>> GetFailedDataStatistics()
+        {
+            try
+            {
+                using var leaderContext = CreateLeaderDbContext();
+                
+                var statistics = await leaderContext.ReplicationFailureLogs
+                    .Where(f => f.FollowerServerId == _followerServerId)
+                    .GroupBy(f => f.TableName)
+                    .Select(g => new { TableName = g.Key, Count = g.Count() })
+                    .ToDictionaryAsync(x => x.TableName, x => x.Count);
+                
+                return statistics;
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"获取失败数据统计信息时出错: {ex.Message}");
+                return new Dictionary<string, int>();
+            }
+        }
+
         // 实现IDisposable接口
         public void Dispose()
         {

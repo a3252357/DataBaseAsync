@@ -671,6 +671,75 @@ namespace DataBaseAsync
             }
         }
         
+        private async void ManualRetryButton_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (_replicator == null)
+                {
+                    AddLog("同步服务未初始化，无法执行手动重试");
+                    MessageBox.Show("同步服务未初始化，请先启动同步服务", "提示", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+                
+                // 显示确认对话框
+                var result = MessageBox.Show(
+                    "手动重试将重置同步进度到最早的错误数据之前，并清除错误日志。\n\n确定要继续吗？",
+                    "确认手动重试",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Question);
+                
+                if (result != MessageBoxResult.Yes)
+                {
+                    return;
+                }
+                
+                AddLog("开始执行手动重试...");
+                
+                // 获取失败数据统计
+                var statistics = await _replicator.GetFailedDataStatistics();
+                if (statistics.Count == 0)
+                {
+                    AddLog("没有找到失败的数据，无需重试");
+                    MessageBox.Show("没有找到失败的数据，无需重试", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+                
+                AddLog($"找到 {statistics.Count} 个表的失败数据:");
+                foreach (var stat in statistics)
+                {
+                    AddLog($"  表 {stat.Key}: {stat.Value} 条失败记录");
+                }
+                
+                // 执行手动重试
+                var retryResult = await _replicator.ManualRetryFailedData();
+                
+                if (retryResult.Success)
+                {
+                    var tableDetails = string.Join(", ", retryResult.ProcessedTables.Select(kvp => $"{kvp.Key}({kvp.Value}条)"));
+                    AddLog($"手动重试完成: 处理了 {retryResult.ProcessedCount} 条失败数据，涉及表: {tableDetails}");
+                    MessageBox.Show(
+                        $"手动重试完成！\n\n{retryResult.Message}\n\n处理详情:\n{tableDetails}",
+                        "重试完成",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Information);
+                    
+                    // 刷新状态显示
+                    await RefreshStatusSilently();
+                }
+                else
+                {
+                    AddLog($"手动重试失败: {retryResult.Message}");
+                    MessageBox.Show($"手动重试失败: {retryResult.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+                }
+            }
+            catch (Exception ex)
+            {
+                AddLog($"手动重试异常: {ex.Message}");
+                MessageBox.Show($"手动重试异常: {ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+        
         private async Task RefreshStatusSilently()
         {
             try
