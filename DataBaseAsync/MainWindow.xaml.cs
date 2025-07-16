@@ -30,7 +30,7 @@ namespace DataBaseAsync
         private DatabaseReplicationConfig _config;
         private List<TableConfig> _tableConfigs;
         private readonly List<string> _logLines = new List<string>();
-        private const int MaxLogLines = 10000;
+        private const int MaxLogLines = 1000; // 减少到1000行，避免界面卡死
         private ConsoleRedirector _consoleRedirector;
         
         // UI日志队列优化相关字段
@@ -38,8 +38,19 @@ namespace DataBaseAsync
         private readonly System.Threading.AutoResetEvent _uiLogEvent = new System.Threading.AutoResetEvent(false);
         private readonly System.Threading.CancellationTokenSource _uiLogCancellationTokenSource = new System.Threading.CancellationTokenSource();
         private System.Threading.Tasks.Task _uiLogProcessorTask;
-        private const int MaxUILogQueueSize = 1000;
+        private const int MaxUILogQueueSize = 200; // 减少队列大小
         private volatile bool _isUILogProcessorRunning = false;
+        private volatile bool _enableRealTimeLog = true; // 默认启用实时日志显示
+        
+        // 缓存相关字段 - 优化内存使用
+        private DateTime _lastStatusRefreshTime = DateTime.MinValue;
+        private readonly TimeSpan _statusCacheTimeout = TimeSpan.FromSeconds(15); // 缓存15秒
+        private List<SyncStatusItem> _cachedLeaderToFollowerStatus;
+        private List<SyncStatusItem> _cachedFollowerToLeaderStatus;
+        
+        // 内存监控相关字段
+        private long _lastMemoryUsage = 0;
+        private DateTime _lastMemoryCheckTime = DateTime.MinValue;
         
         public ObservableCollection<SyncStatusItem> LeaderToFollowerStatus { get; set; }
         public ObservableCollection<SyncStatusItem> FollowerToLeaderStatus { get; set; }
@@ -58,6 +69,9 @@ namespace DataBaseAsync
             LoadConfiguration();
             LoadTableConfigurations(); // 在配置加载后重新加载表配置
             SetupConsoleRedirection();
+            
+            // 设置窗口标题显示从库编码
+            UpdateWindowTitle();
             
             // 启动UI日志处理器
             StartUILogProcessor();
@@ -285,10 +299,10 @@ namespace DataBaseAsync
             _timeTimer.Tick += (s, e) => TimeText.Text = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
             _timeTimer.Start();
             
-            // 状态刷新定时器
+            // 状态刷新定时器 - 优化：减少刷新频率以降低内存使用
             _statusTimer = new DispatcherTimer
             {
-                Interval = TimeSpan.FromSeconds(5)
+                Interval = TimeSpan.FromSeconds(30)
             };
             _statusTimer.Tick += StatusTimer_Tick;
             _statusTimer.Start(); // 启动状态刷新定时器
@@ -310,6 +324,9 @@ namespace DataBaseAsync
                     return;
                 }
                 
+                // 从配置文件读取实时日志设置
+                _enableRealTimeLog = _config.UI?.EnableRealTimeLog ?? true;
+                
                 LeaderConnectionTextBox.Text = _config.LeaderConnectionString;
                 LeaderReadOnlyConnectionTextBox.Text = _config.LeaderReadOnlyConnectionString ?? "";
                 FollowerConnectionTextBox.Text = _config.FollowerConnectionString;
@@ -330,6 +347,25 @@ namespace DataBaseAsync
             catch (Exception ex)
             {
                 AddLog($"加载配置失败: {ex.Message}");
+            }
+        }
+        
+        private void UpdateWindowTitle()
+        {
+            try
+            {
+                if (_config != null && !string.IsNullOrEmpty(_config.FollowerServerId))
+                {
+                    this.Title = $"数据库同步服务 - 从库: {_config.FollowerServerId}";
+                }
+                else
+                {
+                    this.Title = "数据库同步服务";
+                }
+            }
+            catch (Exception ex)
+            {
+                AddLog($"更新窗口标题失败: {ex.Message}");
             }
         }
         
@@ -750,6 +786,17 @@ namespace DataBaseAsync
                     return;
                 }
                 
+                // 缓存机制：检查是否需要刷新数据
+                var now = DateTime.Now;
+                if (_cachedLeaderToFollowerStatus != null && _cachedFollowerToLeaderStatus != null &&
+                    now - _lastStatusRefreshTime < _statusCacheTimeout)
+                {
+                    // 使用缓存数据更新UI
+                    UpdateStatusCollections(LeaderToFollowerStatus, _cachedLeaderToFollowerStatus);
+                    UpdateStatusCollections(FollowerToLeaderStatus, _cachedFollowerToLeaderStatus);
+                    return;
+                }
+                
                 // 获取新的状态数据但不清空现有显示
                 var newLeaderToFollowerStatus = new List<SyncStatusItem>();
                 var newFollowerToLeaderStatus = new List<SyncStatusItem>();
@@ -767,6 +814,11 @@ namespace DataBaseAsync
                 {
                     return;
                 }
+                
+                // 更新缓存
+                _cachedLeaderToFollowerStatus = newLeaderToFollowerStatus;
+                _cachedFollowerToLeaderStatus = newFollowerToLeaderStatus;
+                _lastStatusRefreshTime = now;
                 
                 // 更新现有项目而不是清空重建
                 UpdateStatusCollections(LeaderToFollowerStatus, newLeaderToFollowerStatus);
@@ -929,6 +981,108 @@ namespace DataBaseAsync
             }
         }
         
+        private async void ManualSyncButton_Click(object sender, RoutedEventArgs e)
+        {
+            var button = sender as Button;
+            var tableName = button?.Tag as string;
+            
+            if (string.IsNullOrEmpty(tableName))
+            {
+                AddLog("无法获取表名");
+                return;
+            }
+            
+            // 查找对应的表配置
+            var tableConfigViewModel = TableConfigs.FirstOrDefault(t => t.TableName == tableName);
+            if (tableConfigViewModel == null)
+            {
+                AddLog($"找不到表 {tableName} 的配置");
+                return;
+            }
+            
+            var tableConfig = _tableConfigs?.FirstOrDefault(t => t.TableName == tableName);
+            if (tableConfig == null)
+            {
+                AddLog($"找不到表 {tableName} 的内部配置");
+                return;
+            }
+            
+            if (!tableConfig.Enabled)
+            {
+                AddLog($"表 {tableName} 未启用，无法执行手动同步");
+                return;
+            }
+            
+            try
+            {
+                // 设置同步状态
+                tableConfigViewModel.IsManualSyncing = true;
+                AddLog($"开始手动同步表 {tableName}...");
+                
+                // 暂停该表的自动同步
+                if (_replicator != null)
+                {
+                    await _replicator.PauseTableReplication(tableName);
+                    AddLog($"已暂停表 {tableName} 的自动同步");
+                }
+                
+                // 执行手动同步
+                await PerformManualTableSync(tableConfig);
+                
+                AddLog($"表 {tableName} 手动同步完成");
+            }
+            catch (Exception ex)
+            {
+                AddLog($"表 {tableName} 手动同步失败: {ex.Message}");
+                MessageBox.Show($"手动同步失败: {ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            finally
+            {
+                // 恢复该表的自动同步
+                if (_replicator != null)
+                {
+                    try
+                    {
+                        await _replicator.ResumeTableReplication(tableName);
+                        AddLog($"已恢复表 {tableName} 的自动同步");
+                    }
+                    catch (Exception ex)
+                    {
+                        AddLog($"恢复表 {tableName} 自动同步失败: {ex.Message}");
+                    }
+                }
+                
+                // 重置同步状态
+                tableConfigViewModel.IsManualSyncing = false;
+                
+                // 刷新状态显示
+                await RefreshStatusSilently();
+            }
+        }
+        
+        private async Task PerformManualTableSync(TableConfig tableConfig)
+        {
+            try
+            {
+                if (_replicator == null)
+                {
+                    throw new InvalidOperationException("复制器未初始化");
+                }
+                
+                AddLog($"正在执行表 {tableConfig.TableName} 的完整数据同步...");
+                
+                // 执行该表的完整数据同步
+                await _replicator.SyncTableFromLeaderToFollower(tableConfig);
+                
+                AddLog($"表 {tableConfig.TableName} 完整数据同步完成");
+            }
+            catch (Exception ex)
+            {
+                AddLog($"表 {tableConfig.TableName} 手动同步过程中出错: {ex.Message}");
+                throw;
+            }
+        }
+        
 
         
         private void LoadTimeSyncConfiguration()
@@ -1006,6 +1160,48 @@ namespace DataBaseAsync
             if (_isRunning)
             {
                 await RefreshStatusSilently();
+                
+                // 内存监控 - 每分钟检查一次内存使用情况
+                var now = DateTime.Now;
+                if (now - _lastMemoryCheckTime >= TimeSpan.FromMinutes(1))
+                {
+                    CheckMemoryUsage();
+                    _lastMemoryCheckTime = now;
+                }
+            }
+        }
+        
+        private void CheckMemoryUsage()
+        {
+            try
+            {
+                var currentProcess = System.Diagnostics.Process.GetCurrentProcess();
+                var currentMemoryMB = currentProcess.WorkingSet64 / (1024 * 1024);
+                
+                // 如果内存使用超过1GB，记录警告
+                if (currentMemoryMB > 1024)
+                {
+                    var memoryIncrease = currentMemoryMB - _lastMemoryUsage;
+                    if (_lastMemoryUsage > 0 && memoryIncrease > 100) // 内存增长超过100MB
+                    {
+                        AddLog($"内存使用警告: 当前 {currentMemoryMB}MB (+{memoryIncrease}MB), 日志队列: {_uiLogQueue.Count}, 缓存状态: {(_cachedLeaderToFollowerStatus?.Count ?? 0)}/{(_cachedFollowerToLeaderStatus?.Count ?? 0)}");
+                    }
+                    else if (currentMemoryMB > 1536) // 超过1.5GB时强制记录
+                    {
+                        AddLog($"高内存使用: {currentMemoryMB}MB, 建议重启程序");
+                        
+                        // 强制垃圾回收
+                        GC.Collect();
+                        GC.WaitForPendingFinalizers();
+                        GC.Collect();
+                    }
+                }
+                
+                _lastMemoryUsage = currentMemoryMB;
+            }
+            catch (Exception ex)
+            {
+                // 内存检查失败时不记录日志，避免递归
             }
         }
         
@@ -1173,8 +1369,8 @@ namespace DataBaseAsync
                 }
             }
             
-            // 使用队列机制异步更新UI
-            if (_isUILogProcessorRunning)
+            // 只有启用实时日志时才更新UI，避免界面卡死
+            if (_enableRealTimeLog && _isUILogProcessorRunning)
             {
                 // 检查队列大小，防止内存溢出
                 if (_uiLogQueue.Count < MaxUILogQueueSize)
@@ -1190,28 +1386,10 @@ namespace DataBaseAsync
                     _uiLogEvent.Set();
                 }
             }
-            else
-            {
-                // 如果UI处理器未运行，回退到同步模式（启动阶段）
-                try
-                {
-                    Dispatcher.BeginInvoke(() =>
-                    {
-                        UpdateUIWithLogEntry(logEntry);
-                    }, System.Windows.Threading.DispatcherPriority.Background);
-                }
-                catch
-                {
-                    // 忽略UI更新错误
-                }
-            }
+            // 移除启动阶段的同步模式，完全禁用实时日志显示
         }
         
-        private void ClearMainLogButton_Click(object sender, RoutedEventArgs e)
-        {
-            MainLogTextBox.Clear();
-            AddLog("主界面日志已清空");
-        }
+
         
         private void ShowDetailLogButton_Click(object sender, RoutedEventArgs e)
         {
@@ -1230,6 +1408,8 @@ namespace DataBaseAsync
                 }
             }
         }
+        
+
         
         protected virtual void OnPropertyChanged(string propertyName)
         {
@@ -1307,10 +1487,6 @@ namespace DataBaseAsync
                 // 批量构建日志文本
                 var batchText = string.Join(Environment.NewLine, logBatch) + Environment.NewLine;
                 
-                // 批量更新主界面底部的日志显示框
-                MainLogTextBox.AppendText(batchText);
-                MainLogTextBox.ScrollToEnd();
-                
                 // 批量更新详细日志选项卡的日志显示框
                 // 如果日志行数超过限制，重新构建整个文本
                 if (_logLines.Count >= MaxLogLines - 100) // 提前一点重建，避免频繁操作
@@ -1349,10 +1525,6 @@ namespace DataBaseAsync
         {
             try
             {
-                // 更新主界面底部的日志显示框
-                MainLogTextBox.AppendText(logEntry + Environment.NewLine);
-                MainLogTextBox.ScrollToEnd();
-                
                 // 更新详细日志选项卡的日志显示框
                 // 如果日志行数超过限制，重新构建整个文本
                 if (_logLines.Count >= MaxLogLines - 100) // 提前一点重建，避免频繁操作
@@ -1409,6 +1581,12 @@ namespace DataBaseAsync
                 
                 // 停止控制台重定向
                 _consoleRedirector?.Stop();
+                
+                // 清理缓存以释放内存
+                _cachedLeaderToFollowerStatus?.Clear();
+                _cachedFollowerToLeaderStatus?.Clear();
+                _cachedLeaderToFollowerStatus = null;
+                _cachedFollowerToLeaderStatus = null;
                 
                 // 停止复制器
                 if (_replicator != null)
@@ -1538,6 +1716,8 @@ namespace DataBaseAsync
         private bool _initializeExistingData;
         private string _conflictResolutionPriorityFieldsText;
         private bool _isExistingConfig;
+        private bool _canManualSync = true;
+        private bool _isManualSyncing = false;
 
         public string TableName
         {
@@ -1597,6 +1777,18 @@ namespace DataBaseAsync
         {
             get => _isExistingConfig;
             set { _isExistingConfig = value; OnPropertyChanged(); }
+        }
+
+        public bool CanManualSync
+        {
+            get => _canManualSync && _enabled && !_isManualSyncing;
+            set { _canManualSync = value; OnPropertyChanged(); }
+        }
+
+        public bool IsManualSyncing
+        {
+            get => _isManualSyncing;
+            set { _isManualSyncing = value; OnPropertyChanged(); OnPropertyChanged(nameof(CanManualSync)); }
         }
 
         public event PropertyChangedEventHandler PropertyChanged;

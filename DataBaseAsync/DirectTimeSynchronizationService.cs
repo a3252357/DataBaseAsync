@@ -208,7 +208,7 @@ namespace DataBaseAsync
                 {
                     _logger.Info("已成功请求管理员权限，程序将重新启动");
                     // 当前进程退出
-                    Environment.Exit(0);
+                    Environment.Exit(0);   
                     return true;
                 }
                 else

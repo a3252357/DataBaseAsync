@@ -484,6 +484,10 @@ namespace DatabaseReplication.Follower
                         // 对于删除操作，如果实体不存在，直接执行删除
                         await DeleteEntityInFollower(followerContext, tableConfig, change.Data);
                     }
+                    else
+                    {
+                        throw new Exception("主库数据不存在");
+                    }
 
                     // 每条数据调用一次SaveChanges
                     await followerContext.SaveChangesAsync();
@@ -1133,7 +1137,8 @@ namespace DatabaseReplication.Follower
                     var entityToDelete = await followerContext.FindAsync(tableConfig.EntityType, primaryKeyValue);
                     if (entityToDelete != null)
                     {
-                        dbSet.Remove(entityToDelete);
+                        // 标记为删除状态
+                        followerContext.Entry(entityToDelete).State = EntityState.Deleted;
                         _logger.Info($"在从库删除表 {tableConfig.TableName} 记录 {log.Data}");
                     }
                     break;
@@ -1155,10 +1160,12 @@ namespace DatabaseReplication.Follower
                 throw new InvalidOperationException($"找不到实体 {tableConfig.EntityType.Name} 的主键属性: {tableConfig.PrimaryKey}");
             var convertedValue = Convert.ChangeType(primaryKeyValue, primaryKeyProperty.PropertyType);
             // 对于删除操作，先查找已跟踪的实体
-            var entityToDelete = await followerContext.FindAsync(tableConfig.EntityType, primaryKeyValue);
+            var entityToDelete = await followerContext.FindAsync(tableConfig.EntityType, convertedValue);
             if (entityToDelete != null)
             {
-                dbSet.Remove(entityToDelete);
+                // 标记为删除状态
+                followerContext.Entry(entityToDelete).State = EntityState.Deleted;
+
                 _logger.Info($"在从库删除表 {tableConfig.TableName} 记录 {primaryKeyValue}");
             }
         }
@@ -1531,7 +1538,7 @@ namespace DatabaseReplication.Follower
                     else if (change.OperationType == ReplicationOperation.Delete)
                     {
                         // 对于删除操作，如果实体不存在，直接执行删除
-                        await DeleteEntityInLeader(leaderContext, tableConfig, change.Data);
+                        //await DeleteEntityInLeader(leaderContext, tableConfig, change.Data);
                     }
 
                     // 每条数据调用一次SaveChanges
@@ -2931,6 +2938,117 @@ namespace DatabaseReplication.Follower
                 return new Dictionary<string, int>();
             }
         }
+
+        // 暂停指定表的复制
+        public Task PauseTableReplication(string tableName)
+        {
+            try
+            {
+                var timerKey = $"LeaderToFollower_{tableName}";
+                if (_timers.ContainsKey(timerKey))
+                {
+                    _timers[timerKey]?.Dispose();
+                    _timers.Remove(timerKey);
+                    _logger.Info($"已暂停表 {tableName} 的主库到从库复制");
+                }
+                
+                var followerToLeaderTimerKey = $"FollowerToLeader_{tableName}";
+                if (_timers.ContainsKey(followerToLeaderTimerKey))
+                {
+                    _timers[followerToLeaderTimerKey]?.Dispose();
+                    _timers.Remove(followerToLeaderTimerKey);
+                    _logger.Info($"已暂停表 {tableName} 的从库到主库复制");
+                }
+                
+                return Task.CompletedTask;
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"暂停表 {tableName} 复制时出错: {ex.Message}");
+                throw;
+            }
+        }
+
+        // 恢复指定表的复制
+        public Task ResumeTableReplication(string tableName)
+        {
+            try
+            {
+                var tableConfig = _tableConfigs.FirstOrDefault(t => t.TableName == tableName && t.Enabled);
+                if (tableConfig == null)
+                {
+                    _logger.Warning($"找不到表 {tableName} 的配置或该表未启用");
+                    return Task.CompletedTask;
+                }
+                
+                // 恢复主库到从库的同步计时器
+                if (tableConfig.ReplicationDirection == ReplicationDirection.Bidirectional ||
+                    tableConfig.ReplicationDirection == ReplicationDirection.LeaderToFollower)
+                {
+                    var timerKey = $"LeaderToFollower_{tableConfig.TableName}";
+                    if (!_timers.ContainsKey(timerKey))
+                    {
+                        _executionFlags[timerKey] = false;
+                        
+                        var timer = new Timer(
+                            async _ => await ExecuteWithFlag(timerKey, () => PullAndApplyChanges(tableConfig)),
+                            null,
+                            TimeSpan.Zero,
+                            TimeSpan.FromSeconds(tableConfig.ReplicationIntervalSeconds));
+
+                        _timers[timerKey] = timer;
+                        _logger.Info($"已恢复表 {tableName} 的主库到从库复制");
+                    }
+                }
+
+                // 恢复从库到主库的同步计时器（双向复制）
+                if (tableConfig.ReplicationDirection == ReplicationDirection.Bidirectional ||
+                    tableConfig.ReplicationDirection == ReplicationDirection.FollowerToLeader)
+                {
+                    var timerKey = $"FollowerToLeader_{tableConfig.TableName}";
+                    if (!_timers.ContainsKey(timerKey))
+                    {
+                        _executionFlags[timerKey] = false;
+                        
+                        var timer = new Timer(
+                            async _ => await ExecuteWithFlag(timerKey, () => PushFollowerChangesToLeader(tableConfig)),
+                            null,
+                            TimeSpan.Zero,
+                            TimeSpan.FromSeconds(tableConfig.ReplicationIntervalSeconds));
+
+                        _timers[timerKey] = timer;
+                        _logger.Info($"已恢复表 {tableName} 的从库到主库复制");
+                    }
+                }
+                
+                return Task.CompletedTask;
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"恢复表 {tableName} 复制时出错: {ex.Message}");
+                throw;
+            }
+        }
+
+        // 手动同步指定表从主库到从库
+        public async Task SyncTableFromLeaderToFollower(TableConfig tableConfig)
+        {
+            try
+            {
+                _logger.Info($"开始手动同步表 {tableConfig.TableName} 从主库到从库");
+                
+                // 复用现有的初始化表数据方法，这会清空从库表并完整复制主库数据
+                await InitializeTableData(tableConfig);
+                
+                _logger.Info($"表 {tableConfig.TableName} 手动同步完成");
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"手动同步表 {tableConfig.TableName} 时出错: {ex.Message}");
+                throw;
+            }
+        }
+
 
         // 实现IDisposable接口
         public void Dispose()

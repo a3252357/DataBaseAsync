@@ -13,6 +13,7 @@ namespace DatabaseReplication.Leader
         public int DataRetentionDays { get; set; } = 30; // 数据保留天数，默认30天
         public int CleanupIntervalHours { get; set; } = 24; // 清理任务执行间隔（小时），默认24小时
         public TimeSynchronizationConfig TimeSynchronization { get; set; } = new TimeSynchronizationConfig();
+        public UIConfig UI { get; set; } = new UIConfig();
         public List<TableConfigData> Tables { get; set; } = new List<TableConfigData>();
     }
 
@@ -23,6 +24,11 @@ namespace DatabaseReplication.Leader
         public int MaxAllowedDifferenceSeconds { get; set; } = 5; // 允许的最大时间差异（秒）
         public bool SyncOnStartup { get; set; } = true; // 是否在启动时执行同步
         public int TimeSyncIntervalMinutes { get; set; } = 30; // 时间同步间隔（分钟）
+    }
+
+    public class UIConfig
+    {
+        public bool EnableRealTimeLog { get; set; } = true; // 是否启用实时日志显示
     }
 
     public class TableConfigData
