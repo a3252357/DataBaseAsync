@@ -42,5 +42,9 @@ namespace DatabaseReplication.Leader
         public string ReplicationDirection { get; set; } = string.Empty;
         public string ConflictStrategy { get; set; } = string.Empty;
         public List<string> ConflictResolutionPriorityFields { get; set; } = new List<string>();
+        public string SyncMode { get; set; } = "Entity";
+        public string SchemaSync { get; set; } = "OnStartup";
+        public int SchemaSyncIntervalMinutes { get; set; } = 60;
+        public bool AllowSchemaChanges { get; set; } = true;
     }
 }

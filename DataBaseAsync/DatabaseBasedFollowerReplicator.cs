@@ -12,6 +12,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using DataBaseAsync;
+using Microsoft.EntityFrameworkCore.Storage;
 
 namespace DatabaseReplication.Follower
 {
@@ -60,11 +61,14 @@ namespace DatabaseReplication.Follower
         }
 
         // 启动复制服务
-        public void StartReplication()
+        public async void StartReplication()
         {
             if (_isRunning) return;
 
             _isRunning = true;
+
+            // 首先执行表结构同步
+            await PerformInitialSchemaSync();
 
             foreach (var tableConfig in _tableConfigs.Where(t => t.Enabled))
             {
@@ -98,6 +102,22 @@ namespace DatabaseReplication.Follower
                         TimeSpan.FromSeconds(tableConfig.ReplicationIntervalSeconds));
 
                     _timers[timerKey] = timer;
+                }
+
+                // 启动表结构定期同步计时器
+                if (tableConfig.SchemaSync == SchemaSyncStrategy.Periodic || 
+                    tableConfig.SchemaSync == SchemaSyncStrategy.OnStartupAndPeriodic)
+                {
+                    var schemaTimerKey = $"SchemaSync_{tableConfig.TableName}";
+                    _executionFlags[schemaTimerKey] = false;
+                    
+                    var schemaTimer = new Timer(
+                        async _ => await ExecuteWithFlag(schemaTimerKey, () => SyncTableSchema(tableConfig)),
+                        null,
+                        TimeSpan.FromMinutes(tableConfig.SchemaSyncIntervalMinutes),
+                        TimeSpan.FromMinutes(tableConfig.SchemaSyncIntervalMinutes));
+
+                    _timers[schemaTimerKey] = schemaTimer;
                 }
             }
 
@@ -471,22 +491,46 @@ namespace DatabaseReplication.Follower
             {
                 try
                 {
-                    // 通过主键从主库获取完整实体
-                    var entity = await GetEntityFromLeader(tableConfig, change.Data);
+                    if (tableConfig.SyncMode == TableSyncMode.Entity)
+                    {
+                        // Entity模式：使用EF Core实体处理
+                        var entity = await GetEntityFromLeader(tableConfig, change.Data);
 
-                    if (entity != null)
-                    {
-                        // 应用变更到从库
-                        await ApplyEntityChangeToFollower(followerContext, tableConfig, change, entity);
-                    }
-                    else if (change.OperationType == ReplicationOperation.Delete)
-                    {
-                        // 对于删除操作，如果实体不存在，直接执行删除
-                        await DeleteEntityInFollower(followerContext, tableConfig, change.Data);
+                        if (entity != null)
+                        {
+                            // 应用变更到从库
+                            await ApplyEntityChangeToFollower(followerContext, tableConfig, change, entity);
+                        }
+                        else if (change.OperationType == ReplicationOperation.Delete)
+                        {
+                            // 对于删除操作，如果实体不存在，直接执行删除
+                            await DeleteEntityInFollower(followerContext, tableConfig, change.Data);
+                        }
+                        else
+                        {
+                            throw new Exception("主库数据不存在");
+                        }
                     }
                     else
                     {
-                        throw new Exception("主库数据不存在");
+                         // 从主库获取原始数据
+                        var rawData = await GetRawDataFromLeader(tableConfig, change.Data);
+                        // NoEntity模式：使用原始SQL处理
+                        if (rawData != null && rawData.Count > 0)
+                        {
+                                // 应用变更到从库
+                                await ApplyRawDataChangeToFollower(followerContext, tableConfig, change, rawData);
+                        }
+                        else  if (change.OperationType == ReplicationOperation.Delete)
+                        {
+                            // 对于删除操作，直接执行删除
+                            await DeleteRawDataInFollower(followerContext, tableConfig, change.Data);
+                        }
+                        else
+                        {
+                            
+                            throw new Exception("主库数据不存在");
+                        }
                     }
 
                     // 每条数据调用一次SaveChanges
@@ -1287,7 +1331,10 @@ namespace DatabaseReplication.Follower
 
                 using (var connection = (MySqlConnection)leaderContext.Database.GetDbConnection())
                 {
-                    await connection.OpenAsync();
+                    if (connection.State != ConnectionState.Open)
+                    {
+                        await connection.OpenAsync();
+                    }
                     await using var transaction = await connection.BeginTransactionAsync();
 
                     try
@@ -1527,22 +1574,42 @@ namespace DatabaseReplication.Follower
             {
                 try
                 {
-                    // 通过主键从从库获取完整实体
-                    var entity = await GetEntityFromFollower(tableConfig, change.Data);
-
-                    if (entity != null)
+                    if (tableConfig.SyncMode == TableSyncMode.Entity)
                     {
-                        // 应用变更到主库
-                        await ApplyEntityChangeToLeader(leaderContext, tableConfig, change, entity);
-                    }
-                    else if (change.OperationType == ReplicationOperation.Delete)
-                    {
-                        // 对于删除操作，如果实体不存在，直接执行删除
-                        //await DeleteEntityInLeader(leaderContext, tableConfig, change.Data);
-                    }
+                        // Entity模式：使用EF Core实体处理
+                        var entity = await GetEntityFromFollower(tableConfig, change.Data);
 
-                    // 每条数据调用一次SaveChanges
-                    await leaderContext.SaveChangesAsync();
+                        if (entity != null)
+                        {
+                            // 应用变更到主库
+                            await ApplyEntityChangeToLeader(leaderContext, tableConfig, change, entity);
+                        }
+                        else if (change.OperationType == ReplicationOperation.Delete)
+                        {
+                            // 对于删除操作，如果实体不存在，直接执行删除
+                            //await DeleteEntityInLeader(leaderContext, tableConfig, change.Data);
+                        }
+
+                        // 每条数据调用一次SaveChanges
+                        await leaderContext.SaveChangesAsync();
+                    }
+                    else if (tableConfig.SyncMode == TableSyncMode.NoEntity)
+                    {
+                        // NoEntity模式：使用原始SQL处理
+                        // 从从库获取原始数据
+                        var rawData = await GetRawDataFromFollower(tableConfig, change.Data);
+
+                        if (rawData != null)
+                        {
+                            // 应用原始数据变更到主库
+                            await ApplyRawDataChangeToLeader(tableConfig, change, rawData);
+                        }
+                        else if (change.OperationType == ReplicationOperation.Delete)
+                        {
+                            // 对于删除操作，如果数据不存在，直接执行删除
+                            await DeleteRawDataInLeader(tableConfig, change.Data);
+                        }
+                    }
 
                     _logger.Info($"表 {tableConfig.TableName} 变更 ID {change.Id} 处理成功（从库到主库）");
                     return true; // 成功处理
@@ -1700,6 +1767,326 @@ namespace DatabaseReplication.Follower
             // 标记为删除状态
             leaderContext.Entry(entity).State = EntityState.Deleted;
         }
+
+        #region NoEntity模式数据变更处理方法
+
+        // 从主库获取原始数据（NoEntity模式）
+        private async Task<Dictionary<string, object>> GetRawDataFromLeader(TableConfig tableConfig, string primaryKeyValue)
+        {
+            try
+            {
+                using var connection = new MySqlConnection(_leaderReadOnlyConnectionString);
+                await connection.OpenAsync();
+
+                // 获取表结构信息
+                var tableSchema = await GetTableSchemaFromDatabase(tableConfig.TableName, true);
+                var columns = tableSchema.Columns.Select(c => $"`{c.ColumnName}`").ToList();
+                var columnList = string.Join(", ", columns);
+
+                // 构建查询SQL
+                var sql = $"SELECT {columnList} FROM `{tableConfig.TableName}` WHERE `{tableConfig.PrimaryKey}` = @PrimaryKey";
+
+                using var command = new MySqlCommand(sql, connection);
+                command.Parameters.AddWithValue("@PrimaryKey", primaryKeyValue);
+
+                using var reader = await command.ExecuteReaderAsync();
+                if (await reader.ReadAsync())
+                {
+                    var result = new Dictionary<string, object>();
+                    for (int i = 0; i < reader.FieldCount; i++)
+                    {
+                        var columnName = reader.GetName(i);
+                        var value = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                        result[columnName] = value;
+                    }
+                    return result;
+                }
+
+                return null;
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"从主库获取原始数据失败 - 表: {tableConfig.TableName}, 主键: {primaryKeyValue}, 错误: {ex.Message}");
+                throw;
+            }
+        }
+
+        // 应用原始数据变更到从库（NoEntity模式）
+        private async Task ApplyRawDataChangeToFollower(
+            FollowerDbContext followerContext,
+            TableConfig tableConfig,
+            ReplicationLogEntry log,
+            Dictionary<string, object> data)
+        {
+            try
+            {
+                var connection = (MySqlConnection)followerContext.Database.GetDbConnection();
+                var transaction = followerContext.Database.CurrentTransaction?.GetDbTransaction() as MySqlTransaction;
+                
+                if (connection.State != ConnectionState.Open)
+                {
+                    await connection.OpenAsync();
+                }
+
+                var primaryKeyValue = data[tableConfig.PrimaryKey];
+
+                switch (log.OperationType)
+                {
+                    case ReplicationOperation.Insert:
+                        await ExecuteRawInsert(connection, transaction, tableConfig, data);
+                        _logger.Info($"在从库插入表 {tableConfig.TableName} 记录 {primaryKeyValue}");
+                        break;
+
+                    case ReplicationOperation.Update:
+                        // 先尝试更新，如果记录不存在则插入
+                        var updateResult = await ExecuteRawUpdate(connection, transaction, tableConfig, data);
+                        if (updateResult == 0)
+                        {
+                            await ExecuteRawInsert(connection, transaction, tableConfig, data);
+                            _logger.Info($"在从库中记录不存在，将更新操作转换为插入操作 - 表 {tableConfig.TableName} 记录 {primaryKeyValue}");
+                        }
+                        else
+                        {
+                            _logger.Info($"在从库更新表 {tableConfig.TableName} 记录 {primaryKeyValue}");
+                        }
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"应用原始数据变更到从库失败 - 表: {tableConfig.TableName}, 操作: {log.OperationType}, 错误: {ex.Message}");
+                throw;
+            }
+        }
+
+        // 在从库删除原始数据（NoEntity模式）
+        private async Task DeleteRawDataInFollower(
+            FollowerDbContext followerContext,
+            TableConfig tableConfig,
+            string primaryKeyValue)
+        {
+            try
+            {
+                var connection = (MySqlConnection)followerContext.Database.GetDbConnection();
+                var transaction = followerContext.Database.CurrentTransaction?.GetDbTransaction() as MySqlTransaction;
+                
+                if (connection.State != ConnectionState.Open)
+                {
+                    await connection.OpenAsync();
+                }
+
+                var sql = $"DELETE FROM `{tableConfig.TableName}` WHERE `{tableConfig.PrimaryKey}` = @PrimaryKey";
+                using var command = new MySqlCommand(sql, connection, transaction);
+                command.Parameters.AddWithValue("@PrimaryKey", primaryKeyValue);
+
+                var affectedRows = await command.ExecuteNonQueryAsync();
+                _logger.Info($"在从库删除表 {tableConfig.TableName} 记录 {primaryKeyValue}，影响行数: {affectedRows}");
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"在从库删除原始数据失败 - 表: {tableConfig.TableName}, 主键: {primaryKeyValue}, 错误: {ex.Message}");
+                throw;
+            }
+        }
+
+        // 执行原始插入操作
+        private async Task ExecuteRawInsert(MySqlConnection connection, MySqlTransaction transaction, TableConfig tableConfig, Dictionary<string, object> data)
+        {
+            var columns = data.Keys.Select(k => $"`{k}`").ToList();
+            var parameters = data.Keys.Select(k => $"@{k}").ToList();
+
+            var sql = $"INSERT INTO `{tableConfig.TableName}` ({string.Join(", ", columns)}) VALUES ({string.Join(", ", parameters)})";
+            
+            using var command = new MySqlCommand(sql, connection, transaction);
+            foreach (var kvp in data)
+            {
+                command.Parameters.AddWithValue($"@{kvp.Key}", kvp.Value ?? DBNull.Value);
+            }
+
+            await command.ExecuteNonQueryAsync();
+        }
+
+        // 执行原始更新操作
+        private async Task<int> ExecuteRawUpdate(MySqlConnection connection, MySqlTransaction transaction, TableConfig tableConfig, Dictionary<string, object> data)
+        {
+            var setParts = data.Keys.Where(k => k != tableConfig.PrimaryKey)
+                                   .Select(k => $"`{k}` = @{k}")
+                                   .ToList();
+
+            if (setParts.Count == 0)
+            {
+                return 0; // 没有需要更新的列
+            }
+
+            var sql = $"UPDATE `{tableConfig.TableName}` SET {string.Join(", ", setParts)} WHERE `{tableConfig.PrimaryKey}` = @{tableConfig.PrimaryKey}";
+            
+            using var command = new MySqlCommand(sql, connection, transaction);
+            foreach (var kvp in data)
+            {
+                command.Parameters.AddWithValue($"@{kvp.Key}", kvp.Value ?? DBNull.Value);
+            }
+
+            return await command.ExecuteNonQueryAsync();
+        }
+
+        // 从从库获取原始数据（NoEntity模式）
+        private async Task<Dictionary<string, object>> GetRawDataFromFollower(TableConfig tableConfig, string primaryKeyValue)
+        {
+            try
+            {
+                using var connection = new MySqlConnection(_followerConnectionString);
+                await connection.OpenAsync();
+
+                // 获取表结构信息
+                var tableSchema = await GetTableSchemaFromDatabase(tableConfig.TableName, false);
+                var columns = tableSchema.Columns.Select(c => $"`{c.ColumnName}`").ToList();
+                var columnList = string.Join(", ", columns);
+
+                // 构建查询SQL
+                var sql = $"SELECT {columnList} FROM `{tableConfig.TableName}` WHERE `{tableConfig.PrimaryKey}` = @PrimaryKey";
+
+                using var command = new MySqlCommand(sql, connection);
+                command.Parameters.AddWithValue("@PrimaryKey", primaryKeyValue);
+
+                using var reader = await command.ExecuteReaderAsync();
+                if (await reader.ReadAsync())
+                {
+                    var result = new Dictionary<string, object>();
+                    for (int i = 0; i < reader.FieldCount; i++)
+                    {
+                        var columnName = reader.GetName(i);
+                        var value = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                        result[columnName] = value;
+                    }
+                    return result;
+                }
+                return null;
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"从从库获取原始数据失败 - 表: {tableConfig.TableName}, 主键: {primaryKeyValue}, 错误: {ex.Message}");
+                throw;
+            }
+        }
+
+        // 将原始数据变更应用到主库（NoEntity模式）
+        private async Task ApplyRawDataChangeToLeader(TableConfig tableConfig, ReplicationLogEntry change, Dictionary<string, object> data)
+        {
+            try
+            {
+                using var connection = new MySqlConnection(_leaderConnectionString);
+                await connection.OpenAsync();
+
+                // 设置复制标志
+                using var setFlagCommand = new MySqlCommand("SET @is_replicating = 1", connection);
+                await setFlagCommand.ExecuteNonQueryAsync();
+
+                try
+                {
+                    if (change.OperationType == ReplicationOperation.Insert)
+                    {
+                        await ExecuteRawInsertToLeader(connection, tableConfig, data);
+                    }
+                    else if (change.OperationType == ReplicationOperation.Update)
+                    {
+                        var affectedRows = await ExecuteRawUpdateToLeader(connection, tableConfig, data);
+                        if (affectedRows == 0)
+                        {
+                            // 如果更新没有影响任何行，说明记录不存在，转为插入
+                            await ExecuteRawInsertToLeader(connection, tableConfig, data);
+                            _logger.Info($"主库中记录不存在，将更新操作转换为插入操作 - 表 {tableConfig.TableName}");
+                        }
+                    }
+                }
+                finally
+                {
+                    // 重置复制标志
+                    using var resetFlagCommand = new MySqlCommand("SET @is_replicating = 0", connection);
+                    await resetFlagCommand.ExecuteNonQueryAsync();
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"应用原始数据变更到主库失败 - 表: {tableConfig.TableName}, 错误: {ex.Message}");
+                throw;
+            }
+        }
+
+        // 在主库删除原始数据（NoEntity模式）
+        private async Task DeleteRawDataInLeader(TableConfig tableConfig, string primaryKeyValue)
+        {
+            try
+            {
+                using var connection = new MySqlConnection(_leaderConnectionString);
+                await connection.OpenAsync();
+
+                // 设置复制标志
+                using var setFlagCommand = new MySqlCommand("SET @is_replicating = 1", connection);
+                await setFlagCommand.ExecuteNonQueryAsync();
+
+                try
+                {
+                    var sql = $"DELETE FROM `{tableConfig.TableName}` WHERE `{tableConfig.PrimaryKey}` = @PrimaryKey";
+                    using var command = new MySqlCommand(sql, connection);
+                    command.Parameters.AddWithValue("@PrimaryKey", primaryKeyValue);
+
+                    var affectedRows = await command.ExecuteNonQueryAsync();
+                    _logger.Info($"在主库删除表 {tableConfig.TableName} 记录，主键: {primaryKeyValue}, 影响行数: {affectedRows}");
+                }
+                finally
+                {
+                    // 重置复制标志
+                    using var resetFlagCommand = new MySqlCommand("SET @is_replicating = 0", connection);
+                    await resetFlagCommand.ExecuteNonQueryAsync();
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"在主库删除原始数据失败 - 表: {tableConfig.TableName}, 主键: {primaryKeyValue}, 错误: {ex.Message}");
+                throw;
+            }
+        }
+
+        // 执行原始插入操作到主库
+        private async Task ExecuteRawInsertToLeader(MySqlConnection connection, TableConfig tableConfig, Dictionary<string, object> data)
+        {
+            var columns = string.Join(", ", data.Keys.Select(k => $"`{k}`"));
+            var values = string.Join(", ", data.Keys.Select(k => $"@{k}"));
+            var sql = $"INSERT INTO `{tableConfig.TableName}` ({columns}) VALUES ({values})";
+
+            using var command = new MySqlCommand(sql, connection);
+            foreach (var kvp in data)
+            {
+                command.Parameters.AddWithValue($"@{kvp.Key}", kvp.Value ?? DBNull.Value);
+            }
+
+            await command.ExecuteNonQueryAsync();
+        }
+
+        // 执行原始更新操作到主库
+        private async Task<int> ExecuteRawUpdateToLeader(MySqlConnection connection, TableConfig tableConfig, Dictionary<string, object> data)
+        {
+            var setParts = data.Keys.Where(k => k != tableConfig.PrimaryKey)
+                                   .Select(k => $"`{k}` = @{k}")
+                                   .ToList();
+
+            if (setParts.Count == 0)
+            {
+                return 0; // 没有需要更新的列
+            }
+
+            var sql = $"UPDATE `{tableConfig.TableName}` SET {string.Join(", ", setParts)} WHERE `{tableConfig.PrimaryKey}` = @{tableConfig.PrimaryKey}";
+            
+            using var command = new MySqlCommand(sql, connection);
+            foreach (var kvp in data)
+            {
+                command.Parameters.AddWithValue($"@{kvp.Key}", kvp.Value ?? DBNull.Value);
+            }
+
+            return await command.ExecuteNonQueryAsync();
+        }
+
+        #endregion
 
         // 标记从库变更为已处理
         private async Task MarkFollowerChangesAsProcessed(
@@ -2453,7 +2840,7 @@ namespace DatabaseReplication.Follower
             {
                 string statusTableName = $"replication_status_{_followerServerId}";
                 
-                using var connection = (MySqlConnection)followerContext.Database.GetDbConnection();
+                var connection = (MySqlConnection)followerContext.Database.GetDbConnection();
                 await connection.OpenAsync();
                 
                 var sql = $@"
@@ -3055,5 +3442,697 @@ namespace DatabaseReplication.Follower
         {
             StopReplication();
         }
+
+        #region 表结构同步功能
+
+        // 执行初始表结构同步
+        private async Task PerformInitialSchemaSync()
+        {
+            try
+            {
+                _logger.Info("开始执行初始表结构同步...");
+                
+                var tablesToSync = _tableConfigs.Where(t => t.Enabled && 
+                    t.AllowSchemaChanges && 
+                    (t.SchemaSync == SchemaSyncStrategy.OnStartup || 
+                     t.SchemaSync == SchemaSyncStrategy.OnStartupAndPeriodic)).ToList();
+                
+                if (!tablesToSync.Any())
+                {
+                    _logger.Info("没有需要进行初始表结构同步的表");
+                    return;
+                }
+                
+                _logger.Info($"共有 {tablesToSync.Count} 个表需要进行初始表结构同步");
+                
+                var successCount = 0;
+                var failureCount = 0;
+                
+                foreach (var tableConfig in tablesToSync)
+                {
+                    try
+                    {
+                        var result = await SyncTableSchema(tableConfig);
+                        if (result.Success)
+                        {
+                            successCount++;
+                            if (result.ExecutedStatements.Any())
+                            {
+                                _logger.Info($"表 {tableConfig.TableName} 结构同步完成，执行了 {result.ExecutedStatements.Count} 个变更");
+                            }
+                        }
+                        else
+                        {
+                            failureCount++;
+                            _logger.Error($"表 {tableConfig.TableName} 结构同步失败: {result.ErrorMessage}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        failureCount++;
+                        _logger.Error($"表 {tableConfig.TableName} 结构同步异常: {ex.Message}");
+                    }
+                }
+                
+                _logger.Info($"初始表结构同步完成，成功: {successCount}，失败: {failureCount}");
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"执行初始表结构同步时发生异常: {ex.Message}");
+            }
+        }
+
+        // 同步表结构
+        public async Task<SchemaSyncResult> SyncTableSchema(TableConfig tableConfig)
+        {
+            var result = new SchemaSyncResult
+            {
+                TableName = tableConfig.TableName,
+                Success = false
+            };
+
+            var startTime = DateTime.Now;
+
+            try
+            {
+                _logger.Info($"开始同步表 {tableConfig.TableName} 的结构...");
+
+                // 获取主库和从库的表结构
+                var leaderSchema = await GetTableSchema(tableConfig, true);
+                var followerSchema = await GetTableSchema(tableConfig, false);
+
+                if (leaderSchema == null)
+                {
+                    throw new Exception($"无法获取主库表 {tableConfig.TableName} 的结构信息");
+                }
+
+                if (followerSchema == null)
+                {
+                    // 从库表不存在，需要创建
+                    _logger.Info($"从库表 {tableConfig.TableName} 不存在，将创建表");
+                    var createTableSql = await GenerateCreateTableStatement(leaderSchema);
+                    result.ExecutedStatements.Add(createTableSql);
+                    await ExecuteSchemaChange(createTableSql, false);
+                }
+                else
+                {
+                    // 对比表结构差异
+                    var differences = CompareTableSchemas(leaderSchema, followerSchema);
+                    result.AppliedDifferences = differences;
+
+                    if (differences.HasDifferences)
+                    {
+                        _logger.Info($"检测到表 {tableConfig.TableName} 结构差异，开始应用变更...");
+                        
+                        // 生成并执行ALTER语句
+                        var alterStatements = GenerateAlterTableStatements(differences);
+                        result.ExecutedStatements.AddRange(alterStatements);
+
+                        foreach (var statement in alterStatements)
+                        {
+                            await ExecuteSchemaChange(statement, false);
+                        }
+                    }
+                    else
+                    {
+                        _logger.Info($"表 {tableConfig.TableName} 结构无差异，无需同步");
+                    }
+                }
+
+                result.Success = true;
+                _logger.Info($"表 {tableConfig.TableName} 结构同步完成");
+            }
+            catch (Exception ex)
+            {
+                result.ErrorMessage = ex.Message;
+                _logger.Error($"表 {tableConfig.TableName} 结构同步失败: {ex.Message}");
+            }
+            finally
+            {
+                result.Duration = DateTime.Now - startTime;
+            }
+
+            return result;
+        }
+
+        // 获取表结构信息
+        private async Task<TableSchema> GetTableSchema(TableConfig tableConfig, bool isLeader)
+        {
+            return await GetTableSchemaFromDatabase(tableConfig.TableName, isLeader);
+        }
+
+        // 从实体类获取表结构
+        private TableSchema GetTableSchemaFromEntity(Type entityType, string tableName)
+        {
+            var schema = new TableSchema
+            {
+                TableName = tableName
+            };
+
+            var properties = entityType.GetProperties(BindingFlags.Public | BindingFlags.Instance);
+            var ordinalPosition = 1;
+
+            foreach (var property in properties)
+            {
+                // 跳过导航属性
+                if (property.PropertyType.IsClass && property.PropertyType != typeof(string) && 
+                    !property.PropertyType.IsValueType && Nullable.GetUnderlyingType(property.PropertyType) == null)
+                {
+                    continue;
+                }
+
+                var column = new ColumnInfo
+                {
+                    ColumnName = property.Name,
+                    OrdinalPosition = ordinalPosition++,
+                    IsNullable = IsNullableProperty(property)
+                };
+
+                // 映射.NET类型到MySQL类型
+                column.DataType = MapDotNetTypeToMySql(property.PropertyType);
+                column.FullDataType = GetFullDataType(property.PropertyType, column.DataType);
+
+                schema.Columns.Add(column);
+            }
+
+            return schema;
+        }
+
+        // 从数据库获取表结构
+        private async Task<TableSchema> GetTableSchemaFromDatabase(string tableName, bool isLeader)
+        {
+            var connectionString = isLeader ? _leaderConnectionString : _followerConnectionString;
+            
+            try
+            {
+                using var connection = new MySqlConnection(connectionString);
+                await connection.OpenAsync();
+
+                var schema = new TableSchema
+                {
+                    TableName = tableName
+                };
+
+                // 检查表是否存在
+                var tableExistsQuery = @"
+                    SELECT COUNT(*) 
+                    FROM information_schema.TABLES 
+                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = @TableName";
+
+                using var tableExistsCmd = new MySqlCommand(tableExistsQuery, connection);
+                tableExistsCmd.Parameters.AddWithValue("@TableName", tableName);
+                var tableExists = Convert.ToInt32(await tableExistsCmd.ExecuteScalarAsync()) > 0;
+
+                if (!tableExists)
+                {
+                    return null;
+                }
+
+                // 获取列信息
+                var columnsQuery = @"
+                    SELECT 
+                        COLUMN_NAME,
+                        DATA_TYPE,
+                        COLUMN_TYPE,
+                        IS_NULLABLE,
+                        COLUMN_DEFAULT,
+                        EXTRA,
+                        COLUMN_COMMENT,
+                        CHARACTER_MAXIMUM_LENGTH,
+                        NUMERIC_PRECISION,
+                        NUMERIC_SCALE,
+                        ORDINAL_POSITION
+                    FROM information_schema.COLUMNS 
+                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = @TableName
+                    ORDER BY ORDINAL_POSITION";
+
+                using var columnsCmd = new MySqlCommand(columnsQuery, connection);
+                columnsCmd.Parameters.AddWithValue("@TableName", tableName);
+
+                using var reader = await columnsCmd.ExecuteReaderAsync();
+                while (await reader.ReadAsync())
+                {
+                    var column = new ColumnInfo
+                    {
+                        ColumnName = reader.GetString("COLUMN_NAME"),
+                        DataType = reader.GetString("DATA_TYPE"),
+                        FullDataType = reader.GetString("COLUMN_TYPE"),
+                        IsNullable = reader.GetString("IS_NULLABLE") == "YES",
+                        DefaultValue = reader.IsDBNull("COLUMN_DEFAULT") ? null : reader.GetString("COLUMN_DEFAULT"),
+                        IsAutoIncrement = reader.GetString("EXTRA").Contains("auto_increment"),
+                        Comment = reader.IsDBNull("COLUMN_COMMENT") ? null : reader.GetString("COLUMN_COMMENT"),
+                        MaxLength = reader.IsDBNull("CHARACTER_MAXIMUM_LENGTH") ? null : reader.GetInt32("CHARACTER_MAXIMUM_LENGTH"),
+                        NumericPrecision = reader.IsDBNull("NUMERIC_PRECISION") ? null : reader.GetInt32("NUMERIC_PRECISION"),
+                        NumericScale = reader.IsDBNull("NUMERIC_SCALE") ? null : reader.GetInt32("NUMERIC_SCALE"),
+                        OrdinalPosition = reader.GetInt32("ORDINAL_POSITION")
+                    };
+                    schema.Columns.Add(column);
+                }
+                reader.Close();
+
+                //// 获取索引信息
+                //var indexesQuery = @"
+                //    SELECT 
+                //        INDEX_NAME,
+                //        COLUMN_NAME,
+                //        NON_UNIQUE,
+                //        INDEX_TYPE
+                //    FROM information_schema.STATISTICS 
+                //    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = @TableName
+                //    ORDER BY INDEX_NAME, SEQ_IN_INDEX";
+
+                //using var indexesCmd = new MySqlCommand(indexesQuery, connection);
+                //indexesCmd.Parameters.AddWithValue("@TableName", tableName);
+
+                //var indexDict = new Dictionary<string, IndexInfo>();
+                //using var indexReader = await indexesCmd.ExecuteReaderAsync();
+                //while (await indexReader.ReadAsync())
+                //{
+                //    var indexName = indexReader.GetString("INDEX_NAME");
+                //    var columnName = indexReader.GetString("COLUMN_NAME");
+                //    var nonUnique = indexReader.GetInt32("NON_UNIQUE");
+                //    var indexType = indexReader.GetString("INDEX_TYPE");
+
+                //    if (!indexDict.ContainsKey(indexName))
+                //    {
+                //        indexDict[indexName] = new IndexInfo
+                //        {
+                //            IndexName = indexName,
+                //            IsUnique = nonUnique == 0,
+                //            IsPrimary = indexName == "PRIMARY",
+                //            IndexType = indexType
+                //        };
+                //    }
+                //    indexDict[indexName].ColumnNames.Add(columnName);
+                //}
+                //indexReader.Close();
+
+                //schema.Indexes.AddRange(indexDict.Values);
+
+                // 设置主键
+                var primaryIndex = schema.Indexes.FirstOrDefault(i => i.IsPrimary);
+                if (primaryIndex != null && primaryIndex.ColumnNames.Any())
+                {
+                    schema.PrimaryKey = string.Join(",", primaryIndex.ColumnNames);
+                }
+
+                return schema;
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"获取表 {tableName} 结构信息失败: {ex.Message}");
+                throw;
+            }
+        }
+
+        // 对比表结构
+        private TableSchemaDifference CompareTableSchemas(TableSchema leaderSchema, TableSchema followerSchema)
+        {
+            var differences = new TableSchemaDifference
+            {
+                TableName = leaderSchema.TableName
+            };
+
+            // 对比列
+            var leaderColumns = leaderSchema.Columns.ToDictionary(c => c.ColumnName, c => c);
+            var followerColumns = followerSchema.Columns.ToDictionary(c => c.ColumnName, c => c);
+
+            // 需要添加的列
+            foreach (var leaderColumn in leaderColumns.Values)
+            {
+                if (!followerColumns.ContainsKey(leaderColumn.ColumnName))
+                {
+                    differences.ColumnsToAdd.Add(leaderColumn);
+                }
+            }
+
+            // 需要删除的列
+            foreach (var followerColumn in followerColumns.Values)
+            {
+                if (!leaderColumns.ContainsKey(followerColumn.ColumnName))
+                {
+                    differences.ColumnsToDrop.Add(followerColumn.ColumnName);
+                }
+            }
+
+            // 需要修改的列
+            foreach (var leaderColumn in leaderColumns.Values)
+            {
+                if (followerColumns.TryGetValue(leaderColumn.ColumnName, out var followerColumn))
+                {
+                    if (!AreColumnsEqual(leaderColumn, followerColumn))
+                    {
+                        differences.ColumnsToModify.Add(leaderColumn);
+                    }
+                }
+            }
+
+            // 对比索引
+            var leaderIndexes = leaderSchema.Indexes.Where(i => !i.IsPrimary).ToDictionary(i => i.IndexName, i => i);
+            var followerIndexes = followerSchema.Indexes.Where(i => !i.IsPrimary).ToDictionary(i => i.IndexName, i => i);
+
+            // 需要添加的索引
+            foreach (var leaderIndex in leaderIndexes.Values)
+            {
+                if (!followerIndexes.ContainsKey(leaderIndex.IndexName))
+                {
+                    differences.IndexesToAdd.Add(leaderIndex);
+                }
+            }
+
+            // 需要删除的索引
+            foreach (var followerIndex in followerIndexes.Values)
+            {
+                if (!leaderIndexes.ContainsKey(followerIndex.IndexName))
+                {
+                    differences.IndexesToDrop.Add(followerIndex.IndexName);
+                }
+            }
+
+            return differences;
+        }
+
+        // 判断两个列是否相等
+        private bool AreColumnsEqual(ColumnInfo column1, ColumnInfo column2)
+        {
+            return NormalizeDataType(column1.FullDataType).Equals(NormalizeDataType(column2.FullDataType), StringComparison.OrdinalIgnoreCase) &&
+                   column1.IsNullable == column2.IsNullable &&
+                   column1.DefaultValue == column2.DefaultValue &&
+                   column1.IsAutoIncrement == column2.IsAutoIncrement;
+        }
+
+        // 标准化数据类型，移除显示宽度等差异
+        private string NormalizeDataType(string dataType)
+        {
+            if (string.IsNullOrEmpty(dataType))
+                return dataType;
+
+            // 移除整数类型的显示宽度
+            dataType = System.Text.RegularExpressions.Regex.Replace(dataType, @"\b(tinyint|smallint|mediumint|int|bigint)\(\d+\)", "$1", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            
+            // 移除 unsigned 和 zerofill 等修饰符进行比较（如果需要的话）
+            // dataType = System.Text.RegularExpressions.Regex.Replace(dataType, @"\s+(unsigned|zerofill)", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            
+            return dataType.Trim();
+        }
+
+        // 生成CREATE TABLE语句
+        private async Task<string> GenerateCreateTableStatement(TableSchema schema)
+        {
+            var sql = new System.Text.StringBuilder();
+            sql.AppendLine($"CREATE TABLE `{schema.TableName}` (");
+
+            // 添加列定义
+            var columnDefinitions = new List<string>();
+            foreach (var column in schema.Columns.OrderBy(c => c.OrdinalPosition))
+            {
+                var columnDef = $"  `{column.ColumnName}` {column.FullDataType}";
+                
+                if (!column.IsNullable)
+                {
+                    columnDef += " NOT NULL";
+                }
+                
+                if (!string.IsNullOrEmpty(column.DefaultValue))
+                {
+                    columnDef += $" DEFAULT {column.DefaultValue}";
+                }
+                
+                if (column.IsAutoIncrement)
+                {
+                    columnDef += " AUTO_INCREMENT";
+                }
+                
+                if (!string.IsNullOrEmpty(column.Comment))
+                {
+                    columnDef += $" COMMENT '{column.Comment.Replace("'", "\\'")}'";
+                }
+                
+                columnDefinitions.Add(columnDef);
+            }
+
+            sql.AppendLine(string.Join(",\n", columnDefinitions));
+
+            // 添加主键
+            if (!string.IsNullOrEmpty(schema.PrimaryKey))
+            {
+                sql.AppendLine($",  PRIMARY KEY (`{schema.PrimaryKey.Replace(",", "`,`")}`)");
+            }
+
+            // 添加索引
+            foreach (var index in schema.Indexes.Where(i => !i.IsPrimary))
+            {
+                var indexType = index.IsUnique ? "UNIQUE KEY" : "KEY";
+                var columnList = "`" + string.Join("`,`", index.ColumnNames) + "`";
+                sql.AppendLine($",  {indexType} `{index.IndexName}` ({columnList})");
+            }
+
+            sql.AppendLine(") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
+
+            return sql.ToString();
+        }
+
+        // 生成ALTER TABLE语句
+        private List<string> GenerateAlterTableStatements(TableSchemaDifference differences)
+        {
+            var statements = new List<string>();
+
+            // 删除索引（必须在修改列之前）
+            foreach (var indexName in differences.IndexesToDrop)
+            {
+                statements.Add($"ALTER TABLE `{differences.TableName}` DROP INDEX `{indexName}`;");
+            }
+
+            // 添加列
+            foreach (var column in differences.ColumnsToAdd)
+            {
+                var columnDef = $"`{column.ColumnName}` {column.FullDataType}";
+                
+                if (!column.IsNullable)
+                {
+                    columnDef += " NOT NULL";
+                }
+                
+                if (!string.IsNullOrEmpty(column.DefaultValue))
+                {
+                    columnDef += $" DEFAULT {column.DefaultValue}";
+                }
+                
+                if (column.IsAutoIncrement)
+                {
+                    columnDef += " AUTO_INCREMENT";
+                }
+                
+                if (!string.IsNullOrEmpty(column.Comment))
+                {
+                    columnDef += $" COMMENT '{column.Comment.Replace("'", "\\'")}'";
+                }
+                
+                statements.Add($"ALTER TABLE `{differences.TableName}` ADD COLUMN {columnDef};");
+            }
+
+            // 修改列
+            foreach (var column in differences.ColumnsToModify)
+            {
+                var columnDef = $"`{column.ColumnName}` {column.FullDataType}";
+                
+                if (!column.IsNullable)
+                {
+                    columnDef += " NOT NULL";
+                }
+                
+                if (!string.IsNullOrEmpty(column.DefaultValue))
+                {
+                    columnDef += $" DEFAULT {column.DefaultValue}";
+                }
+                
+                if (column.IsAutoIncrement)
+                {
+                    columnDef += " AUTO_INCREMENT";
+                }
+                
+                if (!string.IsNullOrEmpty(column.Comment))
+                {
+                    columnDef += $" COMMENT '{column.Comment.Replace("'", "\\'")}'";
+                }
+                
+                statements.Add($"ALTER TABLE `{differences.TableName}` MODIFY COLUMN {columnDef};");
+            }
+
+            // 删除列
+            foreach (var columnName in differences.ColumnsToDrop)
+            {
+                statements.Add($"ALTER TABLE `{differences.TableName}` DROP COLUMN `{columnName}`;");
+            }
+
+            // 添加索引
+            foreach (var index in differences.IndexesToAdd)
+            {
+                var indexType = index.IsUnique ? "UNIQUE INDEX" : "INDEX";
+                var columnList = "`" + string.Join("`,`", index.ColumnNames) + "`";
+                statements.Add($"ALTER TABLE `{differences.TableName}` ADD {indexType} `{index.IndexName}` ({columnList});");
+            }
+
+            return statements;
+        }
+
+        // 执行表结构变更
+        private async Task ExecuteSchemaChange(string sql, bool isLeader)
+        {
+            var connectionString = isLeader ? _leaderConnectionString : _followerConnectionString;
+            
+            try
+            {
+                using var connection = new MySqlConnection(connectionString);
+                await connection.OpenAsync();
+                
+                using var command = new MySqlCommand(sql, connection);
+                await command.ExecuteNonQueryAsync();
+                
+                _logger.Info($"执行表结构变更成功: {sql.Substring(0, Math.Min(100, sql.Length))}...");
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"执行表结构变更失败: {sql}\n错误: {ex.Message}");
+                throw;
+            }
+        }
+
+        // 判断属性是否可空
+        private bool IsNullableProperty(PropertyInfo property)
+        {
+            var nullableType = Nullable.GetUnderlyingType(property.PropertyType);
+            if (nullableType != null)
+            {
+                return true;
+            }
+            
+            return !property.PropertyType.IsValueType;
+        }
+
+        // 映射.NET类型到MySQL类型
+        private string MapDotNetTypeToMySql(Type type)
+        {
+            var underlyingType = Nullable.GetUnderlyingType(type) ?? type;
+            
+            return underlyingType.Name switch
+            {
+                nameof(Int32) => "int",
+                nameof(Int64) => "bigint",
+                nameof(Int16) => "smallint",
+                nameof(Byte) => "tinyint",
+                nameof(Boolean) => "tinyint",
+                nameof(DateTime) => "datetime",
+                nameof(DateTimeOffset) => "datetime",
+                nameof(Decimal) => "decimal",
+                nameof(Double) => "double",
+                nameof(Single) => "float",
+                nameof(String) => "varchar",
+                nameof(Guid) => "char",
+                _ => "varchar"
+            };
+        }
+
+        // 获取完整的数据类型定义
+        private string GetFullDataType(Type type, string baseType)
+        {
+            var underlyingType = Nullable.GetUnderlyingType(type) ?? type;
+            
+            return underlyingType.Name switch
+            {
+                nameof(Int32) => "int(11)",
+                nameof(Int64) => "bigint(20)",
+                nameof(Int16) => "smallint(6)",
+                nameof(Byte) => "tinyint(4)",
+                nameof(Boolean) => "tinyint(1)",
+                nameof(DateTime) => "datetime",
+                nameof(DateTimeOffset) => "datetime",
+                nameof(Decimal) => "decimal(18,2)",
+                nameof(Double) => "double",
+                nameof(Single) => "float",
+                nameof(String) => "varchar(255)",
+                nameof(Guid) => "char(36)",
+                _ => "varchar(255)"
+            };
+        }
+
+        // 批量同步所有表的结构
+        public async Task<List<SchemaSyncResult>> SyncAllTableSchemas()
+        {
+            var results = new List<SchemaSyncResult>();
+            
+            foreach (var tableConfig in _tableConfigs.Where(t => t.Enabled && t.AllowSchemaChanges))
+            {
+                try
+                {
+                    var result = await SyncTableSchema(tableConfig);
+                    results.Add(result);
+                }
+                catch (Exception ex)
+                {
+                    results.Add(new SchemaSyncResult
+                    {
+                        TableName = tableConfig.TableName,
+                        Success = false,
+                        ErrorMessage = ex.Message
+                    });
+                }
+            }
+            
+            return results;
+        }
+
+        // 手动触发表结构同步
+        public async Task<SchemaSyncResult> ManualSyncTableSchema(string tableName)
+        {
+            var tableConfig = _tableConfigs.FirstOrDefault(t => t.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase));
+            if (tableConfig == null)
+            {
+                return new SchemaSyncResult
+                {
+                    TableName = tableName,
+                    Success = false,
+                    ErrorMessage = $"未找到表配置: {tableName}"
+                };
+            }
+
+            if (!tableConfig.Enabled)
+            {
+                return new SchemaSyncResult
+                {
+                    TableName = tableName,
+                    Success = false,
+                    ErrorMessage = $"表 {tableName} 的复制功能未启用"
+                };
+            }
+
+            if (!tableConfig.AllowSchemaChanges)
+            {
+                return new SchemaSyncResult
+                {
+                    TableName = tableName,
+                    Success = false,
+                    ErrorMessage = $"表 {tableName} 不允许结构变更"
+                };
+            }
+
+            try
+            {
+                _logger.Info($"手动触发表 {tableName} 的结构同步");
+                return await SyncTableSchema(tableConfig);
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"手动同步表 {tableName} 结构时发生异常: {ex.Message}");
+                return new SchemaSyncResult
+                {
+                    TableName = tableName,
+                    Success = false,
+                    ErrorMessage = ex.Message
+                };
+            }
+        }
+
+        #endregion
     }
 }

@@ -72,6 +72,22 @@ namespace DatabaseReplication
         Error
     }
 
+    // 表同步模式
+    public enum TableSyncMode
+    {
+        Entity,     // 基于实体类的同步
+        NoEntity    // 无需实体类的同步
+    }
+
+    // 表结构同步策略
+    public enum SchemaSyncStrategy
+    {
+        Disabled,           // 禁用表结构同步
+        OnStartup,          // 仅在启动时同步
+        Periodic,           // 定期同步
+        OnStartupAndPeriodic // 启动时和定期同步
+    }
+
     // 表配置
     public class TableConfig
     {
@@ -84,6 +100,12 @@ namespace DatabaseReplication
         public ReplicationDirection ReplicationDirection { get; set; } = ReplicationDirection.LeaderToFollower;
         public ConflictResolutionStrategy ConflictStrategy { get; set; } = ConflictResolutionStrategy.PreferLeader;
         public List<string> ConflictResolutionPriorityFields { get; set; }
+        
+        // 表级同步相关配置
+        public TableSyncMode SyncMode { get; set; } = TableSyncMode.Entity;
+        public SchemaSyncStrategy SchemaSync { get; set; } = SchemaSyncStrategy.OnStartup;
+        public int SchemaSyncIntervalMinutes { get; set; } = 60; // 表结构同步间隔（分钟）
+        public bool AllowSchemaChanges { get; set; } = true; // 是否允许表结构变更
     }
     // 复制日志条目
     public class ReplicationLogEntry
@@ -182,5 +204,67 @@ namespace DatabaseReplication
         public string Message { get; set; }
         public int ProcessedCount { get; set; }
         public Dictionary<string, int> ProcessedTables { get; set; } = new Dictionary<string, int>();
+    }
+
+    // 表结构信息
+    public class TableSchema
+    {
+        public string TableName { get; set; }
+        public List<ColumnInfo> Columns { get; set; } = new List<ColumnInfo>();
+        public List<IndexInfo> Indexes { get; set; } = new List<IndexInfo>();
+        public string PrimaryKey { get; set; }
+        public string Engine { get; set; }
+        public string Charset { get; set; }
+        public string Collation { get; set; }
+    }
+
+    // 列信息
+    public class ColumnInfo
+    {
+        public string ColumnName { get; set; }
+        public string DataType { get; set; }
+        public string FullDataType { get; set; } // 包含长度等完整类型信息
+        public bool IsNullable { get; set; }
+        public string DefaultValue { get; set; }
+        public bool IsAutoIncrement { get; set; }
+        public string Comment { get; set; }
+        public int? MaxLength { get; set; }
+        public int? NumericPrecision { get; set; }
+        public int? NumericScale { get; set; }
+        public int OrdinalPosition { get; set; }
+    }
+
+    // 索引信息
+    public class IndexInfo
+    {
+        public string IndexName { get; set; }
+        public List<string> ColumnNames { get; set; } = new List<string>();
+        public bool IsUnique { get; set; }
+        public bool IsPrimary { get; set; }
+        public string IndexType { get; set; }
+    }
+
+    // 表结构差异
+    public class TableSchemaDifference
+    {
+        public string TableName { get; set; }
+        public List<ColumnInfo> ColumnsToAdd { get; set; } = new List<ColumnInfo>();
+        public List<ColumnInfo> ColumnsToModify { get; set; } = new List<ColumnInfo>();
+        public List<string> ColumnsToDrop { get; set; } = new List<string>();
+        public List<IndexInfo> IndexesToAdd { get; set; } = new List<IndexInfo>();
+        public List<string> IndexesToDrop { get; set; } = new List<string>();
+        public bool HasDifferences => ColumnsToAdd.Any() || ColumnsToModify.Any() || ColumnsToDrop.Any() || IndexesToAdd.Any() || IndexesToDrop.Any();
+        public List<string> Warnings { get; set; } = new List<string>();
+    }
+
+    // 表结构同步结果
+    public class SchemaSyncResult
+    {
+        public bool Success { get; set; }
+        public string TableName { get; set; }
+        public List<string> ExecutedStatements { get; set; } = new List<string>();
+        public string ErrorMessage { get; set; }
+        public TimeSpan Duration { get; set; }
+        public TableSchemaDifference AppliedDifferences { get; set; }
     }
 }

@@ -197,6 +197,10 @@
                                         <DataGridTextColumn Header="复制方向" Binding="{Binding ReplicationDirection}" Width="120" IsReadOnly="True"/>
                                         <DataGridTextColumn Header="冲突策略" Binding="{Binding ConflictStrategy}" Width="120" IsReadOnly="True"/>
                                         <DataGridTextColumn Header="优先级字段" Binding="{Binding ConflictResolutionPriorityFieldsText}" Width="120" IsReadOnly="True"/>
+                                        <DataGridTextColumn Header="同步模式" Binding="{Binding SyncMode}" Width="80" IsReadOnly="True"/>
+                                        <DataGridTextColumn Header="表结构同步" Binding="{Binding SchemaSync}" Width="100" IsReadOnly="True"/>
+                                        <DataGridTextColumn Header="表结构间隔(分钟)" Binding="{Binding SchemaSyncIntervalMinutes}" Width="120" IsReadOnly="True"/>
+                                        <DataGridCheckBoxColumn Header="允许表结构变更" Binding="{Binding AllowSchemaChanges}" Width="120" IsReadOnly="True"/>
                                         <DataGridTemplateColumn Header="手动同步" Width="100">
                                             <DataGridTemplateColumn.CellTemplate>
                                                 <DataTemplate>

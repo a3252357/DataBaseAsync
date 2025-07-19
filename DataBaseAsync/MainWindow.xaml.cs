@@ -16,6 +16,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.IO;
 using DatabaseReplication.Leader;
+using MySqlConnector;
 
 namespace DataBaseAsync
 {
@@ -51,6 +52,13 @@ namespace DataBaseAsync
         // 内存监控相关字段
         private long _lastMemoryUsage = 0;
         private DateTime _lastMemoryCheckTime = DateTime.MinValue;
+        
+        // 数据库连接数监测相关字段
+        private int _leaderConnectionCount = 0;
+        private int _followerConnectionCount = 0;
+        private DispatcherTimer _connectionMonitorTimer;
+        private static int _totalConnectionCount = 0;
+        private static readonly object _connectionCountLock = new object();
         
         public ObservableCollection<SyncStatusItem> LeaderToFollowerStatus { get; set; }
         public ObservableCollection<SyncStatusItem> FollowerToLeaderStatus { get; set; }
@@ -306,6 +314,14 @@ namespace DataBaseAsync
             };
             _statusTimer.Tick += StatusTimer_Tick;
             _statusTimer.Start(); // 启动状态刷新定时器
+            
+            // 连接数监测定时器
+            _connectionMonitorTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromSeconds(0.5) // 每10秒检查一次连接数
+            };
+            _connectionMonitorTimer.Tick += ConnectionMonitorTimer_Tick;
+            _connectionMonitorTimer.Start();
         }
         
         private void LoadConfiguration()
@@ -354,14 +370,19 @@ namespace DataBaseAsync
         {
             try
             {
+                string baseTitle;
                 if (_config != null && !string.IsNullOrEmpty(_config.FollowerServerId))
                 {
-                    this.Title = $"数据库同步服务 - 从库: {_config.FollowerServerId}";
+                    baseTitle = $"数据库同步服务 - 从库: {_config.FollowerServerId}";
                 }
                 else
                 {
-                    this.Title = "数据库同步服务";
+                    baseTitle = "数据库同步服务";
                 }
+                
+                // 添加连接数信息
+                string connectionInfo = $" [主库连接: {_leaderConnectionCount}, 从库连接: {_followerConnectionCount}]";
+                this.Title = baseTitle + connectionInfo;
             }
             catch (Exception ex)
             {
@@ -394,6 +415,17 @@ namespace DataBaseAsync
                     conflictStrategy = ConflictResolutionStrategy.PreferLeader;
                 }
                 
+                // 解析同步模式和表结构同步策略
+                if (!Enum.TryParse<TableSyncMode>(tableConfigData.SyncMode, out var syncMode))
+                {
+                    syncMode = TableSyncMode.Entity; // 默认值
+                }
+                
+                if (!Enum.TryParse<SchemaSyncStrategy>(tableConfigData.SchemaSync, out var schemaSync))
+                {
+                    schemaSync = SchemaSyncStrategy.OnStartup; // 默认值
+                }
+                
                 _tableConfigs.Add(new TableConfig
                 {
                     EntityType = entityType,
@@ -404,7 +436,11 @@ namespace DataBaseAsync
                     InitializeExistingData = tableConfigData.InitializeExistingData,
                     ReplicationDirection = direction,
                     ConflictStrategy = conflictStrategy,
-                    ConflictResolutionPriorityFields = tableConfigData.ConflictResolutionPriorityFields
+                    ConflictResolutionPriorityFields = tableConfigData.ConflictResolutionPriorityFields,
+                    SyncMode = syncMode,
+                    SchemaSync = schemaSync,
+                    SchemaSyncIntervalMinutes = tableConfigData.SchemaSyncIntervalMinutes,
+                    AllowSchemaChanges = tableConfigData.AllowSchemaChanges
                 });
             }
         }
@@ -659,6 +695,9 @@ namespace DataBaseAsync
             {
                 // 停止状态刷新定时器
                 _statusTimer?.Stop();
+                
+                // 停止连接数监测定时器
+                // _connectionMonitorTimer?.Stop();
                 
                 // 停止时间同步定时器
                 if (_timeSyncTimer != null)
@@ -953,7 +992,11 @@ namespace DataBaseAsync
                             Enabled = tableConfig.Enabled,
                             InitializeExistingData = tableConfig.InitializeExistingData,
                             ConflictResolutionPriorityFieldsText = conflictFields,
-                            IsExistingConfig = existingTableNames.Contains(tableConfig.TableName)
+                            IsExistingConfig = existingTableNames.Contains(tableConfig.TableName),
+                            SyncMode = tableConfig.SyncMode.ToString(),
+                            SchemaSync = tableConfig.SchemaSync.ToString(),
+                            SchemaSyncIntervalMinutes = tableConfig.SchemaSyncIntervalMinutes,
+                            AllowSchemaChanges = tableConfig.AllowSchemaChanges
                         });
                     }
                 }
@@ -1168,6 +1211,173 @@ namespace DataBaseAsync
                     CheckMemoryUsage();
                     _lastMemoryCheckTime = now;
                 }
+            }
+        }
+        
+        private void ConnectionMonitorTimer_Tick(object sender, EventArgs e)
+        {
+            try
+            {
+                UpdateConnectionCounts();
+                UpdateWindowTitle();
+            }
+            catch (Exception ex)
+            {
+                AddLog($"连接数监测失败: {ex.Message}");
+            }
+        }
+        
+        private void UpdateConnectionCounts()
+        {
+            try
+            {
+                // 获取主库连接数
+                _leaderConnectionCount = GetConnectionCount(_config.LeaderConnectionString);
+                
+                // 获取从库连接数
+                _followerConnectionCount = GetConnectionCount(_config.FollowerConnectionString);
+            }
+            catch (Exception ex)
+            {
+                AddLog($"获取连接数失败: {ex.Message}");
+            }
+        }
+        
+        private int GetConnectionCount(string connectionString)
+        {
+            try
+            {
+                // 通过反射获取MySqlConnector内部连接池的连接数
+                return GetConnectionPoolCount(connectionString);
+            }
+            catch
+            {
+                // 如果反射失败，返回估算值
+                lock (_connectionCountLock)
+                {
+                    return _totalConnectionCount;
+                }
+            }
+        }
+        
+        private int GetConnectionPoolCount(string connectionString)
+        {
+            try
+            {
+                // 使用反射访问MySqlConnector的连接池
+                var mysqlAssembly = typeof(MySqlConnection).Assembly;
+                
+                // 查找ConnectionPool类型
+                var connectionPoolType = mysqlAssembly.GetTypes()
+                    .FirstOrDefault(t => t.Name == "ConnectionPool");
+                
+                if (connectionPoolType != null)
+                {
+                    // 获取静态字段s_pools
+                    var poolsField = connectionPoolType.GetField("s_pools", 
+                        System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+                    
+                    if (poolsField != null)
+                    {
+                        var pools = poolsField.GetValue(null);
+                        
+                        if (pools != null)
+                        {
+                            // 获取ConcurrentDictionary类型，直接遍历KeyValuePair
+                            var poolsType = pools.GetType();
+                            var getEnumeratorMethod = poolsType.GetMethod("GetEnumerator");
+                            
+                            if (getEnumeratorMethod != null)
+                            {
+                                var enumerator = getEnumeratorMethod.Invoke(pools, null) as System.Collections.IEnumerator;
+                                
+                                if (enumerator != null)
+                                {
+                                    int totalConnections = 0;
+                                    
+                                    while (enumerator.MoveNext())
+                                    {
+                                        var current = enumerator.Current;
+                                        if (current != null)
+                                        {
+                                            // 获取KeyValuePair的Key和Value
+                                            var keyProperty = current.GetType().GetProperty("Key");
+                                            var valueProperty = current.GetType().GetProperty("Value");
+                                            
+                                            if (keyProperty != null && valueProperty != null)
+                                            {
+                                                var key = keyProperty.GetValue(current) as string;
+                                                var pool = valueProperty.GetValue(current);
+                                                
+                                                // 只统计主机和端口相等的连接池
+                                                if (IsHostAndPortEqual(key, connectionString) && pool != null)
+                                                {
+                                                    // 获取m_leasedSessions字段
+                                                    var leasedSessionsField = pool.GetType().GetField("m_leasedSessions", 
+                                                        System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+                                                    
+                                                    if (leasedSessionsField != null)
+                                                    {
+                                                        var leasedSessions = leasedSessionsField.GetValue(pool);
+                                                        if (leasedSessions is System.Collections.ICollection collection)
+                                                        {
+                                                            totalConnections += collection.Count;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    return totalConnections;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // 如果反射失败，尝试简单的连接测试
+                using var connection = new MySqlConnection(connectionString);
+                connection.Open();
+                return 1; // 至少有一个连接
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+        
+        private bool IsHostAndPortEqual(string connectionString1, string connectionString2)
+        {
+            try
+            {
+                var builder1 = new MySqlConnectionStringBuilder(connectionString1);
+                var builder2 = new MySqlConnectionStringBuilder(connectionString2);
+                
+                return string.Equals(builder1.Server, builder2.Server, StringComparison.OrdinalIgnoreCase) &&
+                       builder1.Port == builder2.Port;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+        
+        // 连接计数辅助方法
+        private static void IncrementConnectionCount()
+        {
+            lock (_connectionCountLock)
+            {
+                _totalConnectionCount++;
+            }
+        }
+        
+        private static void DecrementConnectionCount()
+        {
+            lock (_connectionCountLock)
+            {
+                if (_totalConnectionCount > 0)
+                    _totalConnectionCount--;
             }
         }
         
@@ -1718,6 +1928,10 @@ namespace DataBaseAsync
         private bool _isExistingConfig;
         private bool _canManualSync = true;
         private bool _isManualSyncing = false;
+        private string _syncMode;
+        private string _schemaSync;
+        private int _schemaSyncIntervalMinutes;
+        private bool _allowSchemaChanges;
 
         public string TableName
         {
@@ -1789,6 +2003,30 @@ namespace DataBaseAsync
         {
             get => _isManualSyncing;
             set { _isManualSyncing = value; OnPropertyChanged(); OnPropertyChanged(nameof(CanManualSync)); }
+        }
+
+        public string SyncMode
+        {
+            get => _syncMode;
+            set { _syncMode = value; OnPropertyChanged(); }
+        }
+
+        public string SchemaSync
+        {
+            get => _schemaSync;
+            set { _schemaSync = value; OnPropertyChanged(); }
+        }
+
+        public int SchemaSyncIntervalMinutes
+        {
+            get => _schemaSyncIntervalMinutes;
+            set { _schemaSyncIntervalMinutes = value; OnPropertyChanged(); }
+        }
+
+        public bool AllowSchemaChanges
+        {
+            get => _allowSchemaChanges;
+            set { _allowSchemaChanges = value; OnPropertyChanged(); }
         }
 
         public event PropertyChangedEventHandler PropertyChanged;

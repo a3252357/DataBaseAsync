@@ -117,6 +117,20 @@ namespace DatabaseReplication.Leader
                     conflictStrategy = ConflictResolutionStrategy.PreferLeader;
                 }
 
+                // 解析同步模式
+                if (!Enum.TryParse<TableSyncMode>(tableConfigData.SyncMode, out var syncMode))
+                {
+                    logger.Warning($"无效的同步模式: {tableConfigData.SyncMode}，使用默认模式 Entity");
+                    syncMode = TableSyncMode.Entity;
+                }
+
+                // 解析表结构同步策略
+                if (!Enum.TryParse<SchemaSyncStrategy>(tableConfigData.SchemaSync, out var schemaSync))
+                {
+                    logger.Warning($"无效的表结构同步策略: {tableConfigData.SchemaSync}，使用默认策略 OnStartup");
+                    schemaSync = SchemaSyncStrategy.OnStartup;
+                }
+
                 tableConfigs.Add(new TableConfig
                 {
                     EntityType = entityType,
@@ -127,7 +141,11 @@ namespace DatabaseReplication.Leader
                     InitializeExistingData = tableConfigData.InitializeExistingData,
                     ReplicationDirection = direction,
                     ConflictStrategy = conflictStrategy,
-                    ConflictResolutionPriorityFields = tableConfigData.ConflictResolutionPriorityFields
+                    ConflictResolutionPriorityFields = tableConfigData.ConflictResolutionPriorityFields,
+                    SyncMode = syncMode,
+                    SchemaSync = schemaSync,
+                    SchemaSyncIntervalMinutes = tableConfigData.SchemaSyncIntervalMinutes,
+                    AllowSchemaChanges = tableConfigData.AllowSchemaChanges
                 });
             }
             // 创建并初始化主库上下文
