@@ -688,7 +688,10 @@ namespace DatabaseReplication.Follower
 
                                     try
                                     {
-                                        // 使用 MySqlBulkLoader 进行批量插入
+                                        /// <summary>
+                                        /// 使用 MySqlBulkLoader 进行批量插入
+                                        /// 配置正确的NULL值处理，避免DateTime?类型null转换为0000-00-00 00:00:00
+                                        /// </summary>
                                         var bulkLoader = new MySqlBulkLoader(destinationConnection)
                                         {
                                             TableName = tableConfig.TableName,
@@ -698,15 +701,19 @@ namespace DatabaseReplication.Follower
                                             FieldTerminator = ",",
                                             LineTerminator = Environment.NewLine,
                                             FieldQuotationCharacter = '"',
-                                            FieldQuotationOptional = false
+                                            FieldQuotationOptional = true, // 修改为true，只有包含特殊字符的字段才使用引号
+                                            // 配置NULL值处理 - 使用\N作为NULL标识符
+                                            EscapeCharacter = '\\',
+                                            Local = true
                                         };
+                                        
+                                        // MySQL LOAD DATA默认将\N识别为NULL值，无需额外配置
 
                                         // 添加列映射
                                         foreach (var column in columns)
                                         {
                                             bulkLoader.Columns.Add("`"+column+"`");
                                         }
-
                                         // 将 DataReader 转换为 CSV 格式并加载
                                         bulkLoader.SourceStream = new DataReaderStream(reader);
                                         var rowsLoaded = await bulkLoader.LoadAsync();
@@ -769,6 +776,10 @@ namespace DatabaseReplication.Follower
                 return bytesToRead;
             }
 
+            /// <summary>
+            /// 初始化数据，将DataReader转换为CSV格式
+            /// 特别处理DateTime?类型的null值，避免转换为0000-00-00 00:00:00
+            /// </summary>
             private void InitializeData()
             {
                 var csvLines = new List<string>();
@@ -780,7 +791,28 @@ namespace DatabaseReplication.Follower
                     for (int i = 0; i < _reader.FieldCount; i++)
                     {
                         object value = _reader[i];
-                        string valueStr = value == DBNull.Value ? "" : EscapeCsvValue(value.ToString());
+                        string valueStr;
+                        
+                        if (value == DBNull.Value || value == null)
+                        {
+                            // 对于null值，使用\N表示MySQL的NULL值
+                            valueStr = "\\N";
+                        }
+                        else if (value is bool boolValue)
+                        {
+                            // 对于bool类型，转换为0或1
+                            valueStr = boolValue ? "1" : "0";
+                        }
+                        else if (value is ulong ulongValue)
+                        {
+                            // 对于BIT(1)类型（MySQL读取为ulong），转换为0或1
+                            valueStr = ulongValue == 0 ? "\x00" : ulongValue == 1? "\x01": EscapeCsvValue(value.ToString());
+                        }
+                        else
+                        {
+                            valueStr = EscapeCsvValue(value.ToString());
+                        }
+                        
                         row.Add(valueStr);
                     }
                     csvLines.Add(string.Join(",", row));
@@ -798,6 +830,9 @@ namespace DatabaseReplication.Follower
 
             private string EscapeCsvValue(string value)
             {
+                if(value==null){
+                    return "\\N";
+                }
                 if (string.IsNullOrEmpty(value))
                     return "";
 
@@ -3855,7 +3890,13 @@ namespace DatabaseReplication.Follower
                 
                 if (!string.IsNullOrEmpty(column.DefaultValue))
                 {
-                    columnDef += $" DEFAULT {column.DefaultValue}";
+                    // 为字符串类型的默认值添加引号
+                    var defaultValue = column.DefaultValue;
+                    if (IsStringType(column.FullDataType) && !defaultValue.StartsWith("'") && !defaultValue.EndsWith("'"))
+                    {
+                        defaultValue = $"'{defaultValue}'";
+                    }
+                    columnDef += $" DEFAULT {defaultValue}";
                 }
                 
                 if (column.IsAutoIncrement)
@@ -3915,7 +3956,13 @@ namespace DatabaseReplication.Follower
                 
                 if (!string.IsNullOrEmpty(column.DefaultValue))
                 {
-                    columnDef += $" DEFAULT {column.DefaultValue}";
+                    // 为字符串类型的默认值添加引号
+                    var defaultValue = column.DefaultValue;
+                    if (IsStringType(column.FullDataType) && !defaultValue.StartsWith("'") && !defaultValue.EndsWith("'"))
+                    {
+                        defaultValue = $"'{defaultValue}'";
+                    }
+                    columnDef += $" DEFAULT {defaultValue}";
                 }
                 
                 if (column.IsAutoIncrement)
@@ -3943,7 +3990,13 @@ namespace DatabaseReplication.Follower
                 
                 if (!string.IsNullOrEmpty(column.DefaultValue))
                 {
-                    columnDef += $" DEFAULT {column.DefaultValue}";
+                    // 为字符串类型的默认值添加引号
+                    var defaultValue = column.DefaultValue;
+                    if (IsStringType(column.FullDataType) && !defaultValue.StartsWith("'") && !defaultValue.EndsWith("'"))
+                    {
+                        defaultValue = $"'{defaultValue}'";
+                    }
+                    columnDef += $" DEFAULT {defaultValue}";
                 }
                 
                 if (column.IsAutoIncrement)
@@ -3996,6 +4049,21 @@ namespace DatabaseReplication.Follower
                 _logger.Error($"执行表结构变更失败: {sql}\n错误: {ex.Message}");
                 throw;
             }
+        }
+
+        // 判断是否为字符串类型
+        private bool IsStringType(string dataType)
+        {
+            if (string.IsNullOrEmpty(dataType))
+                return false;
+                
+            var lowerType = dataType.ToLower();
+            return lowerType.StartsWith("varchar") || 
+                   lowerType.StartsWith("char") || 
+                   lowerType.StartsWith("text") || 
+                   lowerType.StartsWith("longtext") || 
+                   lowerType.StartsWith("mediumtext") || 
+                   lowerType.StartsWith("tinytext");
         }
 
         // 判断属性是否可空
