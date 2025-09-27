@@ -106,6 +106,7 @@ namespace DatabaseReplication
         public SchemaSyncStrategy SchemaSync { get; set; } = SchemaSyncStrategy.OnStartup;
         public int SchemaSyncIntervalMinutes { get; set; } = 60; // 表结构同步间隔（分钟）
         public bool AllowSchemaChanges { get; set; } = true; // 是否允许表结构变更
+        public bool AllowFollowerToFollowerSync { get; set; } = false; // 是否允许从库到从库同步
     }
     // 复制日志条目
     public class ReplicationLogEntry

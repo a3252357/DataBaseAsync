@@ -43,7 +43,7 @@ namespace Coldairarrow.bgmj.Base.Entity
         /// 预约状态 0预约 1完成
         /// </summary>
         public int? ResStatus { get; set; }
-        
+
         /// <summary>
         /// 预约进厂日期
         /// </summary>

@@ -1,46 +1,36 @@
-﻿
-using System;
+﻿using System;
 using System.ComponentModel.DataAnnotations;
 using System.ComponentModel.DataAnnotations.Schema;
 
-namespace Coldairarrow.bgmj.Entity
+namespace Coldairarrow.CHCSDK.Entity
 {
     /// <summary>
-    /// d_door
+    /// 门禁主机LED对应表
     /// </summary>
-    [Table("d_door")]
-    public class d_door
+    [Table("monitor_accesscontroldeviceled")]
+    public class monitor_accesscontroldeviceled
     {
 
         /// <summary>
-        /// Id
+        /// 主键
         /// </summary>
         [Key, Column(Order = 1)]
         public String Id { get; set; }
 
         /// <summary>
-        /// 门岗编号
+        /// 对应设备ID
         /// </summary>
-        public String doorbh { get; set; }
+        public String DeviceId { get; set; }
 
         /// <summary>
-        /// 门岗名称
+        /// LEDIp
         /// </summary>
-        public String doorname { get; set; }
-
-        /// <summary>
-        /// 门岗类型
-        /// </summary>
-        public String type { get; set; }
-        /// <summary>
-        /// 门岗数据库连接
-        /// </summary>
-        public String dbconstr { get; set; }
+        public String LEDIp { get; set; }
 
         /// <summary>
         /// 备注
         /// </summary>
-        public String Remark { get; set; }
+        public String ReMark { get; set; }
 
         /// <summary>
         /// 使用状态
@@ -66,9 +56,6 @@ namespace Coldairarrow.bgmj.Entity
         /// 修改人
         /// </summary>
         public String ModifyOperator { get; set; }
-        /// <summary>
-        /// 门岗电脑IP
-        /// </summary>
-        public String pcip { get; set; }
+
     }
 }

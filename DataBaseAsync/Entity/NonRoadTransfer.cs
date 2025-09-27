@@ -9,14 +9,19 @@ namespace Coldairarrow.bgmj.Base.Entity
     /// <summary>
     /// 非道路移动机械转场信息实体类
     /// </summary>
-    [Table("d_nonroad_transfer")] 
+    [Table("d_nonroad_transfer")]
     public class NonRoadTransfer
     {
         /// <summary>
         /// 主键
         /// </summary>
         [Key, Column(Order = 1)]
-        public string ID { get; set; }
+        public string Id { get; set; }
+
+        /// <summary>
+        /// 第三方Id
+        /// </summary>
+        public string ThirdId { get; set; }
 
         /// <summary>
         /// 预约编号

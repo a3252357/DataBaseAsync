@@ -223,6 +223,7 @@ namespace DatabaseReplication
         public void Initialize()
         {
             CreateReplicationLogTable();
+            DropAllReplicationStatusForeignKeys();
             CreateReplicationStatusTable();
             CreateReplicationFailureLogTable();
             CreateSyncProgressTable();
@@ -257,14 +258,16 @@ namespace DatabaseReplication
         // 创建复制状态表
         private void CreateReplicationStatusTable()
         {
+            // 先删除可能存在的外键约束
+            DropForeignKeysIfExists("replication_status");
+            
             string createTableSql = @"
                 CREATE TABLE IF NOT EXISTS `replication_status` (
                   `log_entry_id` int NOT NULL,
                   `is_synced` tinyint(1) NOT NULL DEFAULT '0',
                   `sync_time` datetime DEFAULT NULL,
                   `error_message` varchar(500) DEFAULT NULL,
-                  PRIMARY KEY (`log_entry_id`),
-                  FOREIGN KEY (`log_entry_id`) REFERENCES `replication_logs` (`id`)
+                  PRIMARY KEY (`log_entry_id`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
 
             ExecuteSql(createTableSql);
@@ -493,6 +496,111 @@ namespace DatabaseReplication
                     _logger.Error($"SQL: {sql}");
                     throw;
                 }
+            }
+        }
+
+        // 删除所有复制状态表的外键约束
+        private void DropAllReplicationStatusForeignKeys()
+        {
+            try
+            {
+                using (var connection = new MySqlConnection(_connectionString))
+                {
+                    connection.Open();
+                    
+                    // 查询所有以 'replication_status' 开头的表名
+                    string queryTables = @"
+                        SELECT TABLE_NAME 
+                        FROM INFORMATION_SCHEMA.TABLES 
+                        WHERE TABLE_SCHEMA = DATABASE() 
+                        AND TABLE_NAME LIKE 'replication_status%';";
+                    
+                    var statusTables = new List<string>();
+                    using (var command = new MySqlCommand(queryTables, connection))
+                    {
+                        using (var reader = command.ExecuteReader())
+                        {
+                            while (reader.Read())
+                            {
+                                statusTables.Add(reader.GetString("TABLE_NAME"));
+                            }
+                        }
+                    }
+                    
+                    // 对每个状态表删除外键约束
+                    foreach (var tableName in statusTables)
+                    {
+                        DropForeignKeysIfExists(tableName);
+                    }
+                    
+                    _logger.Info($"已检查并删除 {statusTables.Count} 个复制状态表的外键约束");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"删除复制状态表外键约束时出错: {ex.Message}");
+                // 不抛出异常，允许继续执行
+            }
+        }
+
+        // 删除指定表的所有外键约束
+        private void DropForeignKeysIfExists(string tableName)
+        {
+            try
+            {
+                using (var connection = new MySqlConnection(_connectionString))
+                {
+                    connection.Open();
+                    
+                    // 查询表的所有外键约束
+                    string queryForeignKeys = $@"
+                        SELECT CONSTRAINT_NAME 
+                        FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE 
+                        WHERE TABLE_SCHEMA = DATABASE() 
+                        AND TABLE_NAME = '{tableName}' 
+                        AND REFERENCED_TABLE_NAME IS NOT NULL;";
+                    
+                    var foreignKeys = new List<string>();
+                    using (var command = new MySqlCommand(queryForeignKeys, connection))
+                    {
+                        using (var reader = command.ExecuteReader())
+                        {
+                            while (reader.Read())
+                            {
+                                foreignKeys.Add(reader.GetString("CONSTRAINT_NAME"));
+                            }
+                        }
+                    }
+                    
+                    // 删除所有外键约束（仅使用在线DDL）
+                    foreach (var foreignKey in foreignKeys)
+                    {
+                        // 只使用在线DDL删除外键，失败时跳过
+                        string onlineDdlSql = $"ALTER TABLE `{tableName}` DROP FOREIGN KEY `{foreignKey}`, ALGORITHM=INPLACE, LOCK=NONE;";
+                        
+                        try
+                        {
+                            using (var command = new MySqlCommand(onlineDdlSql, connection))
+                            {
+                                command.ExecuteNonQuery();
+                                _logger.Info($"已使用在线DDL删除表 {tableName} 的外键约束: {foreignKey}");
+                            }
+                        }
+                        catch (MySqlException ex) when (ex.Number == 1845 || ex.Number == 1846) // 在线DDL不支持的错误码
+                        {
+                            _logger.Warning($"表 {tableName} 外键 {foreignKey} 不支持在线DDL，已跳过删除以避免锁表: {ex.Message}");
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.Warning($"表 {tableName} 外键 {foreignKey} 在线DDL删除失败，已跳过删除以避免锁表: {ex.Message}");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"删除表 {tableName} 外键约束时出错: {ex.Message}");
+                // 不抛出异常，允许继续执行
             }
         }
     }

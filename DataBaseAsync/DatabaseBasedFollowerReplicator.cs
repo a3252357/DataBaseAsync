@@ -301,6 +301,9 @@ namespace DatabaseReplication.Follower
             using (var le = CreateLeaderDbContext())
             {
                 string tableName = $"replication_status_{_followerServerId}";
+                
+                // 先删除可能存在的外键约束
+                DropForeignKeysIfExists(le, tableName);
 
                 string createTableSql = $@"
                 CREATE TABLE IF NOT EXISTS `{tableName}` (
@@ -308,8 +311,7 @@ namespace DatabaseReplication.Follower
                   `is_synced` tinyint(1) NOT NULL DEFAULT '0',
                   `sync_time` datetime DEFAULT NULL,
                   `error_message` varchar(500) DEFAULT NULL,
-                  PRIMARY KEY (`log_entry_id`),
-                  FOREIGN KEY (`log_entry_id`) REFERENCES `replication_logs` (`id`)
+                  PRIMARY KEY (`log_entry_id`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
 
                 le.Database.ExecuteSqlRaw(createTableSql);
@@ -557,6 +559,11 @@ namespace DatabaseReplication.Follower
             // 重试3次后仍然失败，记录失败数据
             await LogFailedChange(change, tableConfig.TableName, lastException?.Message);
             _logger.Error($"表 {tableConfig.TableName} 变更 ID {change.Id} 重试 {maxRetries} 次后仍然失败: {lastException?.Message}");
+            _logger.Error($"失败变更详细信息 - 操作类型: {change.OperationType}, 数据: {change.Data}, 时间: {change.Timestamp}");
+            if (lastException != null)
+            {
+                _logger.Error($"最后一次异常堆栈: {lastException.StackTrace}");
+            }
             return false; // 处理失败
         }
 
@@ -836,10 +843,17 @@ namespace DatabaseReplication.Follower
                 if (string.IsNullOrEmpty(value))
                     return "";
 
-                // 如果值包含逗号、引号或换行符，用引号括起来并转义引号
-                if (value.Contains(',') || value.Contains('"') || value.Contains('\n') || value.Contains('\r'))
+                // 检查是否需要转义（包含特殊字符：逗号、引号、换行符或反斜杠）
+                bool needsEscaping = value.Contains(',') || value.Contains('"') || 
+                                   value.Contains('\n') || value.Contains('\r') || 
+                                   value.Contains('\\');
+                
+                if (needsEscaping)
                 {
-                    return "\"" + value.Replace("\"", "\"\"") + "\"";
+                    // 先转义反斜杠，再转义引号，最后用引号包围
+                    string escapedValue = value.Replace("\\", "\\\\")  // 反斜杠转义为双反斜杠
+                                               .Replace("\"", "\"\"");  // 引号转义为双引号
+                    return "\"" + escapedValue + "\"";
                 }
 
                 return value;
@@ -866,15 +880,29 @@ namespace DatabaseReplication.Follower
                         _logger.Info($"从主库拉取了 {pendingChanges.Count} 条表 {tableConfig.TableName} 的变更");
 
                         // 应用变更到从库
-                        await ApplyChangesToFollower(followerContext, tableConfig, pendingChanges);
+                        var (successfulChanges, failedChanges) = await ApplyChangesToFollower(followerContext, tableConfig, pendingChanges);
 
-                        // 标记变更为已处理（需要写操作，使用写上下文）
-                        using (var leaderWriteContext = CreateLeaderDbContext())
+                        // 只标记成功的变更为已处理（需要写操作，使用写上下文）
+                        if (successfulChanges.Any())
                         {
-                            await MarkChangesAsProcessed(leaderWriteContext, pendingChanges);
+                            using (var leaderWriteContext = CreateLeaderDbContext())
+                            {
+                                await MarkChangesAsProcessed(leaderWriteContext, successfulChanges);
+                            }
                         }
 
-                        _logger.Info($"成功将 {pendingChanges.Count} 条表 {tableConfig.TableName} 的变更应用到从库");
+                        _logger.Info($"表 {tableConfig.TableName} 变更处理完成: 成功 {successfulChanges.Count} 条，失败 {failedChanges.Count} 条");
+                        
+                        if (failedChanges.Any())
+                        {
+                            _logger.Warning($"表 {tableConfig.TableName} 有 {failedChanges.Count} 条变更处理失败，将在下次同步时重试");
+                            
+                            // 记录详细的失败信息
+                            foreach (var failedChange in failedChanges)
+                            {
+                                _logger.Error($"失败变更详情 - 表: {tableConfig.TableName}, 变更ID: {failedChange.Id}, 操作类型: {failedChange.OperationType}, 数据: {failedChange.Data}, 时间: {failedChange.Timestamp}");
+                            }
+                        }
                     }
                 }
                 return Task.CompletedTask;
@@ -888,7 +916,7 @@ namespace DatabaseReplication.Follower
         {
             // 获取当前表的同步进度
             var lastSyncedId = await GetLastSyncedId(leaderContext, tableConfig.TableName);
-            
+            lastSyncedId = lastSyncedId - 1000;
             string statusTableName = $"replication_status_{_followerServerId}";
 
             var sql = $@"
@@ -1023,7 +1051,7 @@ namespace DatabaseReplication.Follower
         }
 
         // 应用变更到从库（带冲突检测和失败重试）
-        private async Task ApplyChangesToFollower(
+        private async Task<(List<ReplicationLogEntry> successfulChanges, List<ReplicationLogEntry> failedChanges)> ApplyChangesToFollower(
             FollowerDbContext followerContext,
             TableConfig tableConfig,
             List<ReplicationLogEntry> changes)
@@ -1108,11 +1136,20 @@ namespace DatabaseReplication.Follower
             catch (Exception ex)
             {
                 _logger.Error($"应用变更到从库时出错: {ex.Message}");
+                _logger.Error($"异常堆栈: {ex.StackTrace}");
+                
+                // 记录详细的失败变更信息
+                foreach (var change in changes)
+                {
+                    _logger.Error($"整体失败变更详情 - 表: {tableConfig.TableName}, 变更ID: {change.Id}, 操作类型: {change.OperationType}, 数据: {change.Data}, 时间: {change.Timestamp}");
+                }
                 
                 // 如果整个过程失败，将所有变更记录为失败
                 await LogFailedChanges(changes, tableConfig.TableName, ex.Message);
-                throw;
+                failedChanges.AddRange(changes);
             }
+            
+            return (successfulChanges, failedChanges);
         }
 
 
@@ -1453,7 +1490,7 @@ namespace DatabaseReplication.Follower
             _isCleanupExecuting = true;
             try
             {
-                await CleanupOldReplicationLogs();
+                //await CleanupOldReplicationLogs();
             }
             catch (Exception ex)
             {
@@ -1511,7 +1548,7 @@ namespace DatabaseReplication.Follower
         {
             // 获取当前表的从库到主库同步进度
             var lastSyncedId = await GetLastSyncedIdToLeader(followerContext, tableConfig.TableName);
-            
+            lastSyncedId = lastSyncedId - 20;
             string statusTableName = $"replication_status_{_followerServerId}_to_leader";
 
             var sql = $@"
@@ -1552,8 +1589,12 @@ namespace DatabaseReplication.Follower
                 
                 try
                 {
-                    // 设置会话变量防止主库触发器递归
-                    await leaderContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 1");
+                    // 根据配置决定是否设置会话变量防止主库触发器递归
+                    // 如果允许从库到从库同步，则不设置 @is_replicating，让主库触发器正常工作
+                    if (!tableConfig.AllowFollowerToFollowerSync)
+                    {
+                        await leaderContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 1");
+                    }
 
                     // 逐个处理变更
                     foreach (var change in changes)
@@ -1569,10 +1610,11 @@ namespace DatabaseReplication.Follower
                             failedChanges.Add(change);
                         }
                     }
-
-                    // 重置会话变量
-                    await leaderContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 0");
-                    
+                    if (!tableConfig.AllowFollowerToFollowerSync)
+                    {
+                        // 重置会话变量
+                        await leaderContext.Database.ExecuteSqlRawAsync("SET @is_replicating = 0");
+                    }
                     // 提交事务
                     await transaction.CommitAsync();
                     
@@ -1667,6 +1709,11 @@ namespace DatabaseReplication.Follower
             // 重试3次后仍然失败，记录失败数据
             await LogFailedChange(change, tableConfig.TableName, lastException?.Message);
             _logger.Error($"表 {tableConfig.TableName} 变更 ID {change.Id} 重试 {maxRetries} 次后仍然失败（从库到主库）: {lastException?.Message}");
+            _logger.Error($"从库到主库失败变更详细信息 - 操作类型: {change.OperationType}, 数据: {change.Data}, 时间: {change.Timestamp}");
+            if (lastException != null)
+            {
+                _logger.Error($"从库到主库最后一次异常堆栈: {lastException.StackTrace}");
+            }
             return false; // 处理失败
         }
 
@@ -2012,9 +2059,13 @@ namespace DatabaseReplication.Follower
                 using var connection = new MySqlConnection(_leaderConnectionString);
                 await connection.OpenAsync();
 
-                // 设置复制标志
-                using var setFlagCommand = new MySqlCommand("SET @is_replicating = 1", connection);
-                await setFlagCommand.ExecuteNonQueryAsync();
+                // 根据配置决定是否设置复制标志
+                // 如果允许从库到从库同步，则不设置 @is_replicating，让主库触发器正常工作
+                if (!tableConfig.AllowFollowerToFollowerSync)
+                {
+                    using var setFlagCommand = new MySqlCommand("SET @is_replicating = 1", connection);
+                    await setFlagCommand.ExecuteNonQueryAsync();
+                }
 
                 try
                 {
@@ -2035,9 +2086,12 @@ namespace DatabaseReplication.Follower
                 }
                 finally
                 {
-                    // 重置复制标志
-                    using var resetFlagCommand = new MySqlCommand("SET @is_replicating = 0", connection);
-                    await resetFlagCommand.ExecuteNonQueryAsync();
+                    // 重置复制标志（如果之前设置了的话）
+                    if (!tableConfig.AllowFollowerToFollowerSync)
+                    {
+                        using var resetFlagCommand = new MySqlCommand("SET @is_replicating = 0", connection);
+                        await resetFlagCommand.ExecuteNonQueryAsync();
+                    }
                 }
             }
             catch (Exception ex)
@@ -2055,9 +2109,13 @@ namespace DatabaseReplication.Follower
                 using var connection = new MySqlConnection(_leaderConnectionString);
                 await connection.OpenAsync();
 
-                // 设置复制标志
-                using var setFlagCommand = new MySqlCommand("SET @is_replicating = 1", connection);
-                await setFlagCommand.ExecuteNonQueryAsync();
+                // 根据配置决定是否设置复制标志
+                // 如果允许从库到从库同步，则不设置 @is_replicating，让主库触发器正常工作
+                if (!tableConfig.AllowFollowerToFollowerSync)
+                {
+                    using var setFlagCommand = new MySqlCommand("SET @is_replicating = 1", connection);
+                    await setFlagCommand.ExecuteNonQueryAsync();
+                }
 
                 try
                 {
@@ -2070,9 +2128,12 @@ namespace DatabaseReplication.Follower
                 }
                 finally
                 {
-                    // 重置复制标志
-                    using var resetFlagCommand = new MySqlCommand("SET @is_replicating = 0", connection);
-                    await resetFlagCommand.ExecuteNonQueryAsync();
+                    // 重置复制标志（如果之前设置了的话）
+                    if (!tableConfig.AllowFollowerToFollowerSync)
+                    {
+                        using var resetFlagCommand = new MySqlCommand("SET @is_replicating = 0", connection);
+                        await resetFlagCommand.ExecuteNonQueryAsync();
+                    }
                 }
             }
             catch (Exception ex)
@@ -2969,11 +3030,25 @@ namespace DatabaseReplication.Follower
                     var batches = missedChanges.Chunk(_batchSize);
                     foreach (var batch in batches)
                     {
-                        await ApplyChangesToFollower(followerContext, tableConfig, batch.ToList());
+                        var (successfulChanges, failedChanges) = await ApplyChangesToFollower(followerContext, tableConfig, batch.ToList());
                         
-                        // 为写操作创建新的上下文
-                        using var leaderWriteContext = CreateLeaderDbContext();
-                        await MarkChangesAsProcessed(leaderWriteContext, batch.ToList());
+                        // 只标记成功的变更为已处理（为写操作创建新的上下文）
+                        if (successfulChanges.Any())
+                        {
+                            using var leaderWriteContext = CreateLeaderDbContext();
+                            await MarkChangesAsProcessed(leaderWriteContext, successfulChanges);
+                        }
+                        
+                        if (failedChanges.Any())
+                        {
+                            _logger.Warning($"强制同步表 {tableConfig.TableName} 时有 {failedChanges.Count} 条变更处理失败");
+                            
+                            // 记录详细的失败信息
+                            foreach (var failedChange in failedChanges)
+                            {
+                                _logger.Error($"强制同步失败变更详情 - 表: {tableConfig.TableName}, 变更ID: {failedChange.Id}, 操作类型: {failedChange.OperationType}, 数据: {failedChange.Data}, 时间: {failedChange.Timestamp}");
+                            }
+                        }
                     }
                     
                     _logger.Info($"表 {tableConfig.TableName} 强制同步完成");
@@ -3047,6 +3122,32 @@ namespace DatabaseReplication.Follower
                     if (latestLeaderLog != null)
                     {
                         _logger.Info($"检测到冲突：主库在 {latestLeaderLog.Timestamp:yyyy-MM-dd HH:mm:ss.fff} 有新变更，晚于从库变更时间 {followerLog.Timestamp:yyyy-MM-dd HH:mm:ss.fff}");
+                        
+                        // 特殊处理：d_drverinoutevidence表的state字段特殊逻辑
+                        if (tableConfig.TableName == "d_drverinoutevidence")
+                        {
+                            // 获取从库实体数据以比较state字段
+                            var followerEntity = GetEntityFromFollower(tableConfig, followerLog.Data).Result;
+                            if (followerEntity != null)
+                            {
+                                var followerStateProperty = tableConfig.EntityType.GetProperty("state");
+                                var leaderStateProperty = tableConfig.EntityType.GetProperty("state");
+                                
+                                if (followerStateProperty != null && leaderStateProperty != null)
+                                {
+                                    var followerState = followerStateProperty.GetValue(followerEntity)?.ToString();
+                                    var leaderState = leaderStateProperty.GetValue(leaderEntity)?.ToString();
+                                    
+                                    // 如果从库的state等于1，主库的state不等于1，则以从库为准，不认为是冲突
+                                    if (followerState == "1" && leaderState != "1")
+                                    {
+                                        _logger.Info($"d_drverinoutevidence表特殊处理：从库state=1，主库state={leaderState}，以从库为准，允许覆盖");
+                                        return false; // 不认为是冲突，允许从库覆盖主库
+                                    }
+                                }
+                            }
+                        }
+                        
                         return true;
                     }
                 }
@@ -4202,5 +4303,46 @@ namespace DatabaseReplication.Follower
         }
 
         #endregion
+
+        // 删除指定表的所有外键约束
+        private void DropForeignKeysIfExists(DbContext context, string tableName)
+        {
+            try
+            {
+                string getForeignKeysSql = $@"
+                    SELECT CONSTRAINT_NAME 
+                    FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE 
+                    WHERE TABLE_SCHEMA = DATABASE() 
+                    AND TABLE_NAME = '{tableName}' 
+                    AND REFERENCED_TABLE_NAME IS NOT NULL";
+
+                var foreignKeys = new List<string>();
+                using (var command = context.Database.GetDbConnection().CreateCommand())
+                {
+                    command.CommandText = getForeignKeysSql;
+                    context.Database.OpenConnection();
+                    
+                    using (var reader = command.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            foreignKeys.Add(reader.GetString("CONSTRAINT_NAME"));
+                        }
+                    }
+                }
+
+                foreach (var fkName in foreignKeys)
+                {
+                    string dropFkSql = $"ALTER TABLE `{tableName}` DROP FOREIGN KEY `{fkName}`";
+                    context.Database.ExecuteSqlRaw(dropFkSql);
+                    _logger.Info($"已删除表 {tableName} 的外键约束: {fkName}");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"删除表 {tableName} 外键约束时出错: {ex.Message}");
+                // 不抛出异常，允许继续执行
+            }
+        }
     }
 }
